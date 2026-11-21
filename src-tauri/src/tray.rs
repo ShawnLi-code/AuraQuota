@@ -1,4 +1,4 @@
-use crate::models::{QuotaSnapshot, WindowMode};
+use crate::models::WindowMode;
 use crate::providers::{now_hh_mm, ProviderContext, ProviderRegistry};
 use crate::storage::AccountStore;
 use crate::webview_scraper::WebviewBridgeStore;
@@ -121,13 +121,10 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), String> {
                             bridge: Some(Arc::clone(&bridge)),
                             store: Some(Arc::clone(&store)),
                         };
-                        if let Ok(accounts) = registry.refresh_all(&store, &ctx).await {
-                            let snap = QuotaSnapshot {
-                                accounts,
-                                last_updated_at: now_hh_mm(),
-                                polling_interval_secs: 300,
-                            };
-                            let _ = handle.emit("quota-updated", snap);
+                        if let Ok(_accounts) = registry.refresh_all(&store, &ctx).await {
+                            if let Ok(snap) = store.build_snapshot(300, now_hh_mm()) {
+                                let _ = handle.emit("quota-updated", snap);
+                            }
                         }
                     });
                 }

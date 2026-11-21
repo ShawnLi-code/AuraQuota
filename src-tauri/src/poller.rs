@@ -1,4 +1,4 @@
-use crate::models::{AccountQuota, AccountStatus, QuotaSnapshot};
+use crate::models::{AccountQuota, AccountStatus};
 use crate::providers::{now_hh_mm, ProviderContext, ProviderRegistry};
 use crate::storage::AccountStore;
 use crate::webview_scraper::WebviewBridgeStore;
@@ -77,12 +77,9 @@ pub fn spawn_background_poller(
 
             if let Ok(accounts) = registry.refresh_all(&store, &ctx).await {
                 tracker.check_and_notify(&app, &accounts);
-                let snap = QuotaSnapshot {
-                    accounts,
-                    last_updated_at: now_hh_mm(),
-                    polling_interval_secs: POLL_INTERVAL_SECS,
-                };
-                let _ = app.emit("quota-updated", snap);
+                if let Ok(snap) = store.build_snapshot(POLL_INTERVAL_SECS, now_hh_mm()) {
+                    let _ = app.emit("quota-updated", snap);
+                }
             }
         }
     });

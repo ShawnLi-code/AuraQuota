@@ -62,6 +62,10 @@ export interface QuotaSnapshot {
   accounts: AccountQuota[];
   lastUpdatedAt: string;
   pollingIntervalSecs: number;
+  activeAccountId?: string | null;
+  pinnedAccountId?: string | null;
+  activeReason?: string | null;
+  lastActiveMap?: Record<string, number>;
 }
 
 export interface AddAccountRequest {

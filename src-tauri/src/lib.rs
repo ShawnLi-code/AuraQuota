@@ -1,3 +1,4 @@
+pub mod active_tracker;
 pub mod auth_webview;
 pub mod commands;
 pub mod crypto_dpapi;
@@ -68,7 +69,14 @@ pub fn run() {
             }
 
             tray::setup_tray(app.handle())?;
-            spawn_background_poller(app.handle().clone(), store, registry, bridge, tracker);
+            spawn_background_poller(
+                app.handle().clone(),
+                Arc::clone(&store),
+                registry,
+                bridge,
+                tracker,
+            );
+            active_tracker::spawn_active_window_watcher(app.handle().clone(), Arc::clone(&store));
 
             if initial_settings.auto_check_updates && !initial_settings.update_feed_url.is_empty() {
                 let handle = app.handle().clone();
@@ -88,6 +96,8 @@ pub fn run() {
             commands::get_quota_snapshot,
             commands::refresh_all_quotas,
             commands::refresh_single_account,
+            commands::toggle_pin_account,
+            commands::set_active_account,
             commands::add_account,
             commands::remove_account,
             commands::clear_demo_accounts,

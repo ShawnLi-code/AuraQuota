@@ -48,15 +48,8 @@ fn build_ctx(
 }
 
 fn emit_snapshot(app: &AppHandle, store: &AccountStore) {
-    if let Ok(all) = store.list_quotas() {
-        let _ = app.emit(
-            "quota-updated",
-            QuotaSnapshot {
-                accounts: all,
-                last_updated_at: now_hh_mm(),
-                polling_interval_secs: 300,
-            },
-        );
+    if let Ok(snap) = store.build_snapshot(300, now_hh_mm()) {
+        let _ = app.emit("quota-updated", snap);
     }
 }
 
@@ -67,7 +60,7 @@ fn format_discovered_message(label: &str, quota: &AccountQuota) -> String {
         quota
             .status_message
             .clone()
-            .unwrap_or_else(|| format!("已导入{label}，但当前需要重登或检查网络"))
+            .unwrap_or_else(|| format!("检测到{label}，但当前凭据已失效（未导入空白账号）"))
     }
 }
 
@@ -90,25 +83,68 @@ async fn save_and_refresh_discovered(
     explicit_id: &str,
     alias_override: Option<String>,
 ) -> Result<AccountQuota, String> {
+    let ctx = build_ctx(app, bridge, store);
+    let existing = store.get_record(explicit_id)?;
+
     let req = AddAccountRequest {
         platform: discovered.platform,
-        alias: alias_override.unwrap_or(discovered.alias),
-        email: discovered.email,
+        alias: alias_override.unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|r| r.alias.clone())
+                .unwrap_or(discovered.alias)
+        }),
+        email: discovered.email.clone(),
         tier: discovered.tier,
-        plan_label: discovered.plan_label,
+        plan_label: discovered.plan_label.clone(),
         auth_method: discovered.auth_method,
         secret_input: None,
         refresh_token: None,
         profile_id: None,
     };
+
+    // 若库中尚未保存该本机客户端账号，先验证探测是否可用；仅当可用时才落盘入库，避免无效残留文件生成「需重登」废卡
+    if existing.is_none() {
+        let probe_rec = StoredAccountRecord {
+            id: explicit_id.to_string(),
+            platform: discovered.platform,
+            alias: req.alias.clone(),
+            email: req.email.clone(),
+            tier: req.tier,
+            plan_label: req.plan_label.clone(),
+            auth_method: req.auth_method,
+            profile_dir: None,
+            is_demo: false,
+            encrypted_secret: None,
+            cached_quota: None,
+        };
+        if let Some(prov) = registry.provider_for(discovered.platform) {
+            let quota = prov
+                .fetch_quota(&probe_rec, Some(&discovered.creds), &ctx)
+                .await;
+            if quota.status != AccountStatus::Ok {
+                return Ok(quota);
+            }
+            let _ = store.add_account(
+                &req,
+                Some(&discovered.creds),
+                Some(explicit_id.to_string()),
+                None,
+                Some(quota.clone()),
+            )?;
+            let _ = store.update_cached_quota(&quota);
+            emit_snapshot(app, store);
+            return Ok(quota);
+        }
+    }
+
     let rec = store.add_account(
         &req,
         Some(&discovered.creds),
         Some(explicit_id.to_string()),
-        None,
+        existing.and_then(|r| r.profile_dir),
         None,
     )?;
-    let ctx = build_ctx(app, bridge, store);
     let quota = registry.refresh_single(store, &rec, &ctx).await;
     emit_snapshot(app, store);
     Ok(quota)
@@ -202,12 +238,7 @@ async fn save_oauth_browser_account(
 pub async fn get_quota_snapshot(
     store: State<'_, Arc<AccountStore>>,
 ) -> Result<QuotaSnapshot, String> {
-    let accounts = store.list_quotas()?;
-    Ok(QuotaSnapshot {
-        accounts,
-        last_updated_at: now_hh_mm(),
-        polling_interval_secs: 300,
-    })
+    store.build_snapshot(300, now_hh_mm())
 }
 
 #[tauri::command]
@@ -221,11 +252,7 @@ pub async fn refresh_all_quotas(
     let ctx = build_ctx(&app, &bridge, &store);
     let accounts = registry.refresh_all(&store, &ctx).await?;
     tracker.check_and_notify(&app, &accounts);
-    let snap = QuotaSnapshot {
-        accounts,
-        last_updated_at: now_hh_mm(),
-        polling_interval_secs: 300,
-    };
+    let snap = store.build_snapshot(300, now_hh_mm())?;
     let _ = app.emit("quota-updated", snap.clone());
     Ok(snap)
 }
@@ -247,7 +274,32 @@ pub async fn refresh_single_account(
     if let Ok(all) = store.list_quotas() {
         tracker.check_and_notify(&app, &all);
     }
+    emit_snapshot(&app, &store);
     Ok(quota)
+}
+
+#[tauri::command]
+pub async fn toggle_pin_account(
+    app: AppHandle,
+    account_id: String,
+    store: State<'_, Arc<AccountStore>>,
+) -> Result<QuotaSnapshot, String> {
+    store.toggle_pin_account(&account_id)?;
+    let snap = store.build_snapshot(300, now_hh_mm())?;
+    let _ = app.emit("quota-updated", snap.clone());
+    Ok(snap)
+}
+
+#[tauri::command]
+pub async fn set_active_account(
+    app: AppHandle,
+    account_id: String,
+    store: State<'_, Arc<AccountStore>>,
+) -> Result<QuotaSnapshot, String> {
+    let _ = store.set_active_account(&account_id, "当前选中焦点", true)?;
+    let snap = store.build_snapshot(300, now_hh_mm())?;
+    let _ = app.emit("quota-updated", snap.clone());
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -319,16 +371,7 @@ pub async fn add_account(
         registry.refresh_single(&store, &record, &ctx).await
     };
 
-    if let Ok(all) = store.list_quotas() {
-        let _ = app.emit(
-            "quota-updated",
-            QuotaSnapshot {
-                accounts: all,
-                last_updated_at: now_hh_mm(),
-                polling_interval_secs: 300,
-            },
-        );
-    }
+    emit_snapshot(&app, &store);
 
     Ok(quota)
 }
@@ -341,16 +384,7 @@ pub async fn remove_account(
 ) -> Result<bool, String> {
     let removed = store.remove_account(&account_id)?;
     if removed {
-        if let Ok(all) = store.list_quotas() {
-            let _ = app.emit(
-                "quota-updated",
-                QuotaSnapshot {
-                    accounts: all,
-                    last_updated_at: now_hh_mm(),
-                    polling_interval_secs: 300,
-                },
-            );
-        }
+        emit_snapshot(&app, &store);
     }
     Ok(removed)
 }
@@ -360,11 +394,7 @@ pub async fn clear_demo_accounts(
     store: State<'_, Arc<AccountStore>>,
 ) -> Result<QuotaSnapshot, String> {
     store.clear_demo_accounts()?;
-    Ok(QuotaSnapshot {
-        accounts: store.list_quotas()?,
-        last_updated_at: now_hh_mm(),
-        polling_interval_secs: 300,
-    })
+    store.build_snapshot(300, now_hh_mm())
 }
 
 #[tauri::command]
@@ -372,11 +402,7 @@ pub async fn restore_demo_accounts(
     store: State<'_, Arc<AccountStore>>,
 ) -> Result<QuotaSnapshot, String> {
     store.restore_demo_accounts()?;
-    Ok(QuotaSnapshot {
-        accounts: store.list_quotas()?,
-        last_updated_at: now_hh_mm(),
-        polling_interval_secs: 300,
-    })
+    store.build_snapshot(300, now_hh_mm())
 }
 
 fn agy_account_id_for_email(email: &str) -> String {
@@ -844,10 +870,12 @@ pub async fn detect_codex_cli_local(
                 alias,
             )
             .await?;
+            let valid = quota.status == AccountStatus::Ok
+                || store.get_record("codex-local-cli")?.is_some();
             Ok(DetectLocalResult {
-                found: true,
+                found: valid,
                 message: format_discovered_message("本机 Codex 凭据", &quota),
-                account: Some(quota),
+                account: if valid { Some(quota) } else { None },
             })
         }
         Err(msg) => Ok(DetectLocalResult {
@@ -881,10 +909,12 @@ pub async fn detect_claude_cli_local(
                 alias,
             )
             .await?;
+            let valid = quota.status == AccountStatus::Ok
+                || store.get_record("claude-local-cli")?.is_some();
             Ok(DetectLocalResult {
-                found: true,
+                found: valid,
                 message: format_discovered_message("本机 Claude 凭据", &quota),
-                account: Some(quota),
+                account: if valid { Some(quota) } else { None },
             })
         }
         Err(msg) => Ok(DetectLocalResult {
@@ -918,10 +948,12 @@ pub async fn detect_commandcode_cli_local(
                 alias,
             )
             .await?;
+            let valid =
+                quota.status == AccountStatus::Ok || store.get_record("cc-local-cli")?.is_some();
             Ok(DetectLocalResult {
-                found: true,
+                found: valid,
                 message: format_discovered_message("本机 Command Code 凭据", &quota),
-                account: Some(quota),
+                account: if valid { Some(quota) } else { None },
             })
         }
         Err(msg) => Ok(DetectLocalResult {
@@ -955,10 +987,12 @@ pub async fn detect_opencode_cli_local(
                 alias,
             )
             .await?;
+            let valid =
+                quota.status == AccountStatus::Ok || store.get_record("oc-local-cli")?.is_some();
             Ok(DetectLocalResult {
-                found: true,
+                found: valid,
                 message: format_discovered_message("本机 OpenCode 凭据", &quota),
-                account: Some(quota),
+                account: if valid { Some(quota) } else { None },
             })
         }
         Err(msg) => Ok(DetectLocalResult {
@@ -977,7 +1011,7 @@ pub async fn scan_local_accounts(
     bridge: State<'_, Arc<WebviewBridgeStore>>,
 ) -> Result<ScanLocalSummary, String> {
     let agy =
-        detect_antigravity_local_inner(&app, None, true, &store, &registry, &bridge).await?;
+        detect_antigravity_local_inner(&app, None, false, &store, &registry, &bridge).await?;
     let claude = detect_claude_cli_local(
         app.clone(),
         None,
@@ -1051,16 +1085,7 @@ pub async fn scan_local_accounts(
 
     let found_count = items.iter().filter(|i| i.found).count();
     if found_count > 0 {
-        if let Ok(all) = store.list_quotas() {
-            let _ = app.emit(
-                "quota-updated",
-                QuotaSnapshot {
-                    accounts: all,
-                    last_updated_at: now_hh_mm(),
-                    polling_interval_secs: 300,
-                },
-            );
-        }
+        emit_snapshot(&app, &store);
     }
 
     Ok(ScanLocalSummary { items, found_count })

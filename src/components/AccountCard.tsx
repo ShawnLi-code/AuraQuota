@@ -1,12 +1,25 @@
 import React, { useState } from 'react';
-import { ChevronDown, ChevronUp, KeyRound, RefreshCw, Trash2, Wallet } from 'lucide-react';
+import {
+  ChevronDown,
+  ChevronUp,
+  KeyRound,
+  Pin,
+  PinOff,
+  RefreshCw,
+  Trash2,
+  Wallet,
+} from 'lucide-react';
 import { AccountQuota, PLATFORMS } from '../types';
 
 interface AccountCardProps {
   account: AccountQuota;
+  variant?: 'hero' | 'compact';
+  isPinned?: boolean;
+  activeLabel?: string | null;
   expanded: boolean;
   privacy: boolean;
   onToggleExpand: () => void;
+  onTogglePin: (id: string) => Promise<void>;
   onRefresh: (id: string) => Promise<void>;
   onReauth: (account: AccountQuota) => void;
   onRemove: (id: string) => Promise<void>;
@@ -15,7 +28,7 @@ interface AccountCardProps {
 export function getBarColorClass(pct: number): string {
   if (pct <= 25) return 'bg-gradient-to-r from-rose-500 to-orange-400';
   if (pct <= 55) return 'bg-gradient-to-r from-amber-400 to-yellow-300';
-  return 'bg-gradient-to-r from-sky-400 to-indigo-400';
+  return 'bg-gradient-to-r from-teal-400 via-sky-400 to-indigo-400';
 }
 
 export function getPctColorVar(pct: number): string {
@@ -32,11 +45,28 @@ function maskEmail(email: string, privacy: boolean): string {
   return `${user.slice(0, 2)}•••@${domain}`;
 }
 
+function compactPoolLabel(name: string): string {
+  if (name.includes('Gemini 模型池 (5h)')) return 'Gem 5h';
+  if (name.includes('Gemini 模型池 (周)')) return 'Gem 周';
+  if (name.includes('Argon 模型池')) return name.replace(' 模型池', '');
+  if (name.includes('Claude / GPT 池 (5h)')) return 'Claude 5h';
+  if (name.includes('Claude / GPT 池 (周)')) return 'Claude 周';
+  if (name.startsWith('5小时')) return '5h';
+  if (name.startsWith('7天周')) return '周';
+  if (name.startsWith('月度')) return '月';
+  if (name.length > 12) return name.slice(0, 12);
+  return name;
+}
+
 export const AccountCard: React.FC<AccountCardProps> = ({
   account,
+  variant = 'compact',
+  isPinned = false,
+  activeLabel,
   expanded,
   privacy,
   onToggleExpand,
+  onTogglePin,
   onRefresh,
   onReauth,
   onRemove,
@@ -48,13 +78,22 @@ export const AccountCard: React.FC<AccountCardProps> = ({
     ? account.alias.slice(dupPrefix.length)
     : account.alias;
 
-  const handleRefreshClick = async () => {
+  const isHero = variant === 'hero';
+  const showDetails = isHero || expanded;
+
+  const handleRefreshClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
     setRefreshing(true);
     try {
       await onRefresh(account.id);
     } finally {
       setRefreshing(false);
     }
+  };
+
+  const handlePinClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    await onTogglePin(account.id);
   };
 
   const statusTag = (() => {
@@ -86,93 +125,159 @@ export const AccountCard: React.FC<AccountCardProps> = ({
         </span>
       );
     }
+    if (isHero) {
+      return (
+        <span className="px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 inline-flex items-center gap-1 shrink-0">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+          {isPinned ? '已固定' : activeLabel || '使用中'}
+        </span>
+      );
+    }
     return null;
   })();
 
-  return (
-    <li className="glass-card rounded-2xl p-3.5 list-none">
-      <button
-        type="button"
-        aria-expanded={expanded}
-        onClick={onToggleExpand}
-        className="w-full text-left rounded-xl"
-      >
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <span
-              aria-hidden="true"
-              className="w-2.5 h-2.5 rounded-full shrink-0"
-              style={{
-                background: pInfo.color,
-                boxShadow: `0 0 8px ${pInfo.color}88`,
-              }}
-            />
-            <span className="text-[12.5px] font-semibold truncate">
-              {pInfo.name} · {displayAlias}
-            </span>
-            {account.tier === 'paid' ? (
-              <span
-                className="px-1.5 py-0.5 rounded-md text-[10px] font-semibold shrink-0"
-                style={{
-                  background: 'var(--badge-paid-bg)',
-                  color: 'var(--badge-paid-text)',
-                  border: '1px solid var(--badge-paid-border)',
-                }}
-              >
-                {account.planLabel}
-              </span>
-            ) : (
-              <span
-                className="px-1.5 py-0.5 rounded-md text-[10px] font-medium shrink-0"
-                style={{
-                  background: 'var(--pill-bg)',
-                  color: 'var(--text-sub)',
-                  border: '1px solid var(--border-subtle)',
-                }}
-              >
-                {account.planLabel}
-              </span>
-            )}
-            {statusTag}
-          </div>
+  const compactSummaryText = (() => {
+    if (account.statusMessage && account.status !== 'ok' && account.status !== 'demo') {
+      return account.statusMessage;
+    }
+    const parts = account.subPools
+      .slice(0, 3)
+      .map((sp) => `${compactPoolLabel(sp.name)} ${sp.pct}%`);
+    if (account.extraBalance) {
+      parts.push(`余额 ${account.extraBalance.amount}`);
+    }
+    return parts.length > 0 ? parts.join(' · ') : '剩余主额度';
+  })();
 
-          <div className="flex items-center gap-1.5 shrink-0">
+  return (
+    <li
+      className={`${
+        isHero ? 'glass-hero-card rounded-2xl p-3.5' : 'glass-card rounded-[14px] px-3 py-2.5'
+      } list-none`}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          aria-expanded={showDetails}
+          onClick={onToggleExpand}
+          className="flex items-center gap-2 min-w-0 flex-1 text-left"
+        >
+          <span
+            aria-hidden="true"
+            className="w-2 h-2 rounded-full shrink-0"
+            style={{
+              background: pInfo.color,
+              boxShadow: `0 0 8px ${pInfo.color}99`,
+            }}
+          />
+          <span className={`${isHero ? 'text-[13px]' : 'text-[12px]'} font-semibold truncate`}>
+            {pInfo.name} · {displayAlias}
+          </span>
+          {account.tier === 'paid' ? (
             <span
-              className="text-sm font-bold tabular-nums"
+              className="px-1.5 py-0.5 rounded-md text-[10px] font-semibold shrink-0"
+              style={{
+                background: 'var(--badge-paid-bg)',
+                color: 'var(--badge-paid-text)',
+                border: '1px solid var(--badge-paid-border)',
+              }}
+            >
+              {account.planLabel}
+            </span>
+          ) : (
+            <span
+              className="px-1.5 py-0.5 rounded-md text-[10px] font-medium shrink-0"
+              style={{
+                background: 'var(--pill-bg)',
+                color: 'var(--text-sub)',
+                border: '1px solid var(--border-subtle)',
+              }}
+            >
+              {account.planLabel}
+            </span>
+          )}
+          {statusTag}
+        </button>
+
+        <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            onClick={(e) => void handlePinClick(e)}
+            title={isPinned ? '取消固定，恢复自动跟随正在使用的应用' : '手动置顶为当前主焦点'}
+            aria-label={isPinned ? '取消置顶' : '置顶此账号'}
+            className={`p-1 rounded-lg transition ${
+              isPinned
+                ? 'text-sky-400 bg-sky-400/15'
+                : 'opacity-55 hover:opacity-100 hover:text-sky-400'
+            }`}
+          >
+            {isPinned ? (
+              <PinOff className="w-3 h-3" aria-hidden="true" />
+            ) : (
+              <Pin className="w-3 h-3" aria-hidden="true" />
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={onToggleExpand}
+            className="flex items-center gap-1"
+            aria-label={expanded ? '收起详情' : '展开详情'}
+          >
+            <span
+              className={`${isHero ? 'text-base' : 'text-[13px]'} font-bold tabular-nums`}
               style={{ color: getPctColorVar(account.primaryPct) }}
             >
               {account.primaryPct}%
             </span>
-            {expanded ? (
-              <ChevronUp className="w-3.5 h-3.5 opacity-60" aria-hidden="true" />
-            ) : (
-              <ChevronDown className="w-3.5 h-3.5 opacity-60" aria-hidden="true" />
-            )}
+            {!isHero &&
+              (expanded ? (
+                <ChevronUp className="w-3.5 h-3.5 opacity-55" aria-hidden="true" />
+              ) : (
+                <ChevronDown className="w-3.5 h-3.5 opacity-55" aria-hidden="true" />
+              ))}
+          </button>
+        </div>
+      </div>
+
+      {!isHero && (
+        <button type="button" onClick={onToggleExpand} className="w-full text-left mt-2">
+          <div
+            className="h-1 rounded-full overflow-hidden"
+            style={{ background: 'var(--track-bg)' }}
+          >
+            <div
+              className={`bar-fill h-full rounded-full ${getBarColorClass(account.primaryPct)}`}
+              style={{ width: `${account.primaryPct}%` }}
+            />
+          </div>
+          <div
+            className="mt-1.5 flex items-center justify-between gap-2 text-[10.5px]"
+            style={{ color: 'var(--text-sub)' }}
+          >
+            <span className="truncate">{compactSummaryText}</span>
+            <span className="shrink-0 tabular-nums opacity-80">{account.resetIn}</span>
+          </div>
+        </button>
+      )}
+
+      {isHero && account.subPools.length === 0 && (
+        <div className="mt-2.5">
+          <div
+            className="h-1.5 rounded-full overflow-hidden"
+            style={{ background: 'var(--track-bg)' }}
+          >
+            <div
+              className={`bar-fill h-full rounded-full ${getBarColorClass(account.primaryPct)}`}
+              style={{ width: `${account.primaryPct}%` }}
+            />
           </div>
         </div>
+      )}
 
+      {showDetails && (
         <div
-          className="mt-2.5 h-1.5 rounded-full overflow-hidden"
-          style={{ background: 'var(--track-bg)' }}
-        >
-          <div
-            className={`bar-fill h-full rounded-full ${getBarColorClass(account.primaryPct)}`}
-            style={{ width: `${account.primaryPct}%` }}
-          />
-        </div>
-
-        <div
-          className="mt-1.5 flex items-center justify-between text-[11px]"
-          style={{ color: 'var(--text-sub)' }}
-        >
-          <span>剩余主额度</span>
-          <span className="tabular-nums">{account.resetIn}</span>
-        </div>
-      </button>
-
-      {expanded && (
-        <div
-          className="mt-3 pt-2.5 space-y-2.5"
+          className={`${isHero ? 'mt-2.5 pt-2' : 'mt-2.5 pt-2.5'} space-y-2`}
           style={{ borderTop: '1px solid var(--divider)' }}
         >
           {account.subPools.map((sp) => (
@@ -250,7 +355,7 @@ export const AccountCard: React.FC<AccountCardProps> = ({
               {!account.isDemo && (
                 <button
                   type="button"
-                  onClick={handleRefreshClick}
+                  onClick={(e) => void handleRefreshClick(e)}
                   disabled={refreshing}
                   className="inline-flex items-center gap-1 hover:text-sky-500 transition"
                 >

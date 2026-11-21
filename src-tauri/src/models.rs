@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -105,6 +106,14 @@ pub struct QuotaSnapshot {
     pub accounts: Vec<AccountQuota>,
     pub last_updated_at: String,
     pub polling_interval_secs: u64,
+    #[serde(default)]
+    pub active_account_id: Option<String>,
+    #[serde(default)]
+    pub pinned_account_id: Option<String>,
+    #[serde(default)]
+    pub active_reason: Option<String>,
+    #[serde(default)]
+    pub last_active_map: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

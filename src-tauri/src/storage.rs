@@ -1,9 +1,11 @@
 use crate::crypto_dpapi::{protect_string, unprotect_string};
 use crate::models::{
     AccountQuota, AccountStatus, AddAccountRequest, AuthMethod, ExtraBalance, PlatformId,
-    SecretCredentials, StoredAccountRecord, SubPool, SubscriptionTier,
+    QuotaSnapshot, SecretCredentials, StoredAccountRecord, SubPool, SubscriptionTier,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -13,6 +15,14 @@ use std::sync::Mutex;
 struct VaultFile {
     version: u32,
     accounts: Vec<StoredAccountRecord>,
+    #[serde(default)]
+    active_account_id: Option<String>,
+    #[serde(default)]
+    pinned_account_id: Option<String>,
+    #[serde(default)]
+    active_reason: Option<String>,
+    #[serde(default)]
+    last_active_map: HashMap<String, i64>,
 }
 
 pub struct AccountStore {
@@ -50,6 +60,7 @@ impl AccountStore {
             state: Mutex::new(VaultFile {
                 version: 1,
                 accounts: Vec::new(),
+                ..Default::default()
             }),
         };
         store.load_or_seed()?;
@@ -78,6 +89,7 @@ impl AccountStore {
         let seeded = VaultFile {
             version: 1,
             accounts: build_demo_records(),
+            ..Default::default()
         };
         {
             let mut guard = self.state.lock().map_err(|_| "存储锁异常".to_string())?;
@@ -107,31 +119,170 @@ impl AccountStore {
         Ok(guard.accounts.iter().find(|r| r.id == id).cloned())
     }
 
+    fn quota_for_record(r: &StoredAccountRecord) -> AccountQuota {
+        r.cached_quota.clone().unwrap_or_else(|| AccountQuota {
+            id: r.id.clone(),
+            platform: r.platform,
+            alias: r.alias.clone(),
+            email: r.email.clone(),
+            tier: r.tier,
+            plan_label: r.plan_label.clone(),
+            primary_pct: 100,
+            reset_in: "待同步".to_string(),
+            sub_pools: Vec::new(),
+            extra_balance: None,
+            status: AccountStatus::Syncing,
+            status_message: None,
+            auth_method: r.auth_method,
+            last_synced_at: None,
+            is_demo: r.is_demo,
+        })
+    }
+
     pub fn list_quotas(&self) -> Result<Vec<AccountQuota>, String> {
         let guard = self.state.lock().map_err(|_| "存储锁异常".to_string())?;
-        Ok(guard
-            .accounts
-            .iter()
-            .map(|r| {
-                r.cached_quota.clone().unwrap_or_else(|| AccountQuota {
-                    id: r.id.clone(),
-                    platform: r.platform,
-                    alias: r.alias.clone(),
-                    email: r.email.clone(),
-                    tier: r.tier,
-                    plan_label: r.plan_label.clone(),
-                    primary_pct: 100,
-                    reset_in: "待同步".to_string(),
-                    sub_pools: Vec::new(),
-                    extra_balance: None,
-                    status: AccountStatus::Syncing,
-                    status_message: None,
-                    auth_method: r.auth_method,
-                    last_synced_at: None,
-                    is_demo: r.is_demo,
-                })
+        Ok(guard.accounts.iter().map(Self::quota_for_record).collect())
+    }
+
+    pub fn current_active_state(&self) -> (Option<String>, Option<String>, Option<String>) {
+        self.state
+            .lock()
+            .map(|g| {
+                (
+                    g.pinned_account_id.clone(),
+                    g.active_account_id.clone(),
+                    g.active_reason.clone(),
+                )
             })
-            .collect())
+            .unwrap_or((None, None, None))
+    }
+
+    pub fn last_active_timestamps(&self) -> HashMap<String, i64> {
+        self.state
+            .lock()
+            .map(|g| g.last_active_map.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn build_snapshot(
+        &self,
+        polling_interval_secs: u64,
+        last_updated_at: String,
+    ) -> Result<QuotaSnapshot, String> {
+        let guard = self.state.lock().map_err(|_| "存储锁异常".to_string())?;
+        let accounts: Vec<AccountQuota> = guard.accounts.iter().map(Self::quota_for_record).collect();
+
+        let exists = |id: &str| accounts.iter().any(|a| a.id == id);
+        let pinned_account_id = guard
+            .pinned_account_id
+            .as_ref()
+            .filter(|id| exists(id))
+            .cloned();
+
+        let active_account_id = if let Some(ref pid) = pinned_account_id {
+            Some(pid.clone())
+        } else if let Some(ref aid) = guard.active_account_id {
+            if exists(aid) {
+                Some(aid.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+        .or_else(|| {
+            accounts
+                .iter()
+                .filter(|a| !a.is_demo)
+                .max_by_key(|a| {
+                    let ok_bonus = (a.status == AccountStatus::Ok) as i64 * 1_000_000_000_000;
+                    let ts = guard.last_active_map.get(&a.id).copied().unwrap_or(0);
+                    ok_bonus + ts
+                })
+                .map(|a| a.id.clone())
+        })
+        .or_else(|| accounts.first().map(|a| a.id.clone()));
+
+        let active_reason = if pinned_account_id.is_some() {
+            Some("已手动置顶".to_string())
+        } else {
+            guard.active_reason.clone().or_else(|| {
+                active_account_id
+                    .as_ref()
+                    .and_then(|aid| accounts.iter().find(|a| &a.id == aid))
+                    .map(|a| format!("{} · 最近使用", a.platform.display_name()))
+            })
+        };
+
+        Ok(QuotaSnapshot {
+            accounts,
+            last_updated_at,
+            polling_interval_secs,
+            active_account_id,
+            pinned_account_id,
+            active_reason,
+            last_active_map: guard.last_active_map.clone(),
+        })
+    }
+
+    pub fn set_active_account(
+        &self,
+        id: &str,
+        reason: &str,
+        force_override_pin: bool,
+    ) -> Result<bool, String> {
+        let mut guard = self.state.lock().map_err(|_| "存储锁异常".to_string())?;
+        if !guard.accounts.iter().any(|a| a.id == id) {
+            return Ok(false);
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        let prev_ts = guard.last_active_map.get(id).copied().unwrap_or(0);
+        let ts_moved = (now_ms - prev_ts).abs() >= 30_000;
+        guard.last_active_map.insert(id.to_string(), now_ms);
+
+        let is_locked_elsewhere = !force_override_pin
+            && guard
+                .pinned_account_id
+                .as_deref()
+                .is_some_and(|pid| pid != id && guard.accounts.iter().any(|a| a.id == pid));
+
+        if is_locked_elsewhere {
+            if ts_moved {
+                self.save_locked(&guard)?;
+            }
+            return Ok(false);
+        }
+
+        let changed = guard.active_account_id.as_deref() != Some(id)
+            || guard.active_reason.as_deref() != Some(reason);
+        guard.active_account_id = Some(id.to_string());
+        guard.active_reason = Some(reason.to_string());
+
+        if changed || ts_moved {
+            self.save_locked(&guard)?;
+        }
+        Ok(changed)
+    }
+
+    pub fn toggle_pin_account(&self, id: &str) -> Result<(), String> {
+        let mut guard = self.state.lock().map_err(|_| "存储锁异常".to_string())?;
+        if !guard.accounts.iter().any(|a| a.id == id) {
+            return Err(format!("未找到账号 {id}"));
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        guard.last_active_map.insert(id.to_string(), now_ms);
+
+        if guard.pinned_account_id.as_deref() == Some(id) {
+            guard.pinned_account_id = None;
+            guard.active_reason = Some("已恢复自动跟随".to_string());
+        } else {
+            guard.pinned_account_id = Some(id.to_string());
+            guard.active_account_id = Some(id.to_string());
+            guard.active_reason = Some("已手动置顶".to_string());
+        }
+        self.save_locked(&guard)?;
+        Ok(())
     }
 
     pub fn add_account(
@@ -177,6 +328,17 @@ impl AccountStore {
         let mut guard = self.state.lock().map_err(|_| "存储锁异常".to_string())?;
         guard.accounts.retain(|a| a.id != id);
         guard.accounts.insert(0, record.clone());
+        guard
+            .last_active_map
+            .insert(id.clone(), Utc::now().timestamp_millis());
+        let no_active_or_demo = guard
+            .active_account_id
+            .as_deref()
+            .is_none_or(|aid| aid.starts_with("demo-"));
+        if no_active_or_demo && guard.pinned_account_id.is_none() {
+            guard.active_account_id = Some(id);
+            guard.active_reason = Some("新接入账号".to_string());
+        }
         self.save_locked(&guard)?;
         Ok(record)
     }
@@ -205,15 +367,47 @@ impl AccountStore {
 
     pub fn update_cached_quota(&self, quota: &AccountQuota) -> Result<(), String> {
         let mut guard = self.state.lock().map_err(|_| "存储锁异常".to_string())?;
+        let mut usage_dropped = false;
         if let Some(rec) = guard.accounts.iter_mut().find(|a| a.id == quota.id) {
+            if !quota.is_demo && quota.status == AccountStatus::Ok {
+                if let Some(prev) = rec.cached_quota.as_ref().filter(|p| p.status == AccountStatus::Ok) {
+                    if quota.primary_pct < prev.primary_pct
+                        || quota.sub_pools.iter().any(|sp| {
+                            prev.sub_pools
+                                .iter()
+                                .find(|osp| osp.name == sp.name)
+                                .is_some_and(|osp| sp.pct < osp.pct)
+                        })
+                    {
+                        usage_dropped = true;
+                    }
+                }
+            }
+
             rec.plan_label = quota.plan_label.clone();
             rec.tier = quota.tier;
             if is_placeholder_email(&rec.email) && !is_placeholder_email(&quota.email) {
                 rec.email = quota.email.clone();
             }
             rec.cached_quota = Some(quota.clone());
-            self.save_locked(&guard)?;
+        } else {
+            return Ok(());
         }
+
+        if usage_dropped {
+            let now_ms = Utc::now().timestamp_millis();
+            guard.last_active_map.insert(quota.id.clone(), now_ms);
+            let pinned_elsewhere = guard
+                .pinned_account_id
+                .as_deref()
+                .is_some_and(|pid| pid != quota.id);
+            if !pinned_elsewhere {
+                guard.active_account_id = Some(quota.id.clone());
+                guard.active_reason =
+                    Some(format!("{} · 额度刚变化", quota.platform.display_name()));
+            }
+        }
+        self.save_locked(&guard)?;
         Ok(())
     }
 
@@ -223,6 +417,14 @@ impl AccountStore {
         guard.accounts.retain(|a| a.id != id);
         let removed = guard.accounts.len() != before;
         if removed {
+            if guard.pinned_account_id.as_deref() == Some(id) {
+                guard.pinned_account_id = None;
+            }
+            if guard.active_account_id.as_deref() == Some(id) {
+                guard.active_account_id = None;
+                guard.active_reason = None;
+            }
+            guard.last_active_map.remove(id);
             self.save_locked(&guard)?;
         }
         Ok(removed)
@@ -231,6 +433,21 @@ impl AccountStore {
     pub fn clear_demo_accounts(&self) -> Result<(), String> {
         let mut guard = self.state.lock().map_err(|_| "存储锁异常".to_string())?;
         guard.accounts.retain(|a| !a.is_demo);
+        if guard
+            .pinned_account_id
+            .as_deref()
+            .is_some_and(|id| !guard.accounts.iter().any(|a| a.id == id))
+        {
+            guard.pinned_account_id = None;
+        }
+        if guard
+            .active_account_id
+            .as_deref()
+            .is_some_and(|id| !guard.accounts.iter().any(|a| a.id == id))
+        {
+            guard.active_account_id = None;
+            guard.active_reason = None;
+        }
         self.save_locked(&guard)?;
         Ok(())
     }

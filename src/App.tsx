@@ -19,6 +19,7 @@ import {
   scanLocalAccounts,
   setThemeVibrancy,
   setWindowMode,
+  togglePinAccount,
 } from './api/tauriClient';
 import { AddAccountModal, AuthModeId } from './components/AddAccountModal';
 import { EdgeDockView } from './components/EdgeDockView';
@@ -28,7 +29,7 @@ import { SettingsModal } from './components/SettingsModal';
 import {
   AccountQuota,
   PlatformId,
-  SubscriptionTier,
+  QuotaSnapshot,
   UpdateCheckResult,
   WindowMode,
 } from './types';
@@ -37,11 +38,13 @@ export const App: React.FC = () => {
   const [mode, setMode] = useState<WindowMode>('panel');
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [accounts, setAccounts] = useState<AccountQuota[]>([]);
+  const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
+  const [pinnedAccountId, setPinnedAccountId] = useState<string | null>(null);
+  const [activeReason, setActiveReason] = useState<string | null>(null);
+  const [lastActiveMap, setLastActiveMap] = useState<Record<string, number>>({});
   const [lastUpdatedAt, setLastUpdatedAt] = useState('刚刚');
-  const [filterPlatform, setFilterPlatform] = useState<'all' | PlatformId>('all');
-  const [filterTier, setFilterTier] = useState<'all' | SubscriptionTier>('all');
   const [privacy, setPrivacy] = useState(false);
-  const [expandedId, setExpandedId] = useState<string | null>('demo-agy-1');
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [refreshingAll, setRefreshingAll] = useState(false);
 
   const [addOpen, setAddOpen] = useState(false);
@@ -68,6 +71,17 @@ export const App: React.FC = () => {
     }, 2400);
   }, []);
 
+  const applySnapshot = useCallback((snap: QuotaSnapshot) => {
+    setAccounts(snap.accounts);
+    setLastUpdatedAt(snap.lastUpdatedAt);
+    setActiveAccountId(snap.activeAccountId ?? null);
+    setPinnedAccountId(snap.pinnedAccountId ?? null);
+    setActiveReason(snap.activeReason ?? null);
+    if (snap.lastActiveMap) {
+      setLastActiveMap(snap.lastActiveMap);
+    }
+  }, []);
+
   useEffect(() => {
     if (!isTauriRuntime()) {
       document.body.classList.add('browser-preview');
@@ -90,11 +104,7 @@ export const App: React.FC = () => {
     });
 
     void getQuotaSnapshot().then((snap) => {
-      setAccounts(snap.accounts);
-      setLastUpdatedAt(snap.lastUpdatedAt);
-      if (snap.accounts.length > 0) {
-        setExpandedId(snap.accounts[0].id);
-      }
+      applySnapshot(snap);
     });
 
     let unlistenQuota: (() => void) | undefined;
@@ -103,8 +113,7 @@ export const App: React.FC = () => {
     let unlistenUpdateAvail: (() => void) | undefined;
 
     void onQuotaUpdated((snap) => {
-      setAccounts(snap.accounts);
-      setLastUpdatedAt(snap.lastUpdatedAt);
+      applySnapshot(snap);
     }).then((fn) => {
       unlistenQuota = fn;
     });
@@ -134,24 +143,22 @@ export const App: React.FC = () => {
       unlistenOpenSettings?.();
       unlistenUpdateAvail?.();
     };
-  }, [showToast]);
+  }, [applySnapshot, showToast]);
 
-  const { avgPct, lowestLabel, hasLowAlert } = useMemo(() => {
+  const { spotlightAccount, hasLowAlert } = useMemo(() => {
     if (accounts.length === 0) {
-      return { avgPct: 0, lowestLabel: '暂无账号', hasLowAlert: false };
+      return { spotlightAccount: null as AccountQuota | null, hasLowAlert: false };
     }
-    const avg = Math.round(accounts.reduce((sum, a) => sum + a.primaryPct, 0) / accounts.length);
-    const lowest = accounts.reduce(
-      (min, a) => (a.primaryPct < min.primaryPct ? a : min),
-      accounts[0]
-    );
+    const spot =
+      accounts.find((a) => a.id === pinnedAccountId) ??
+      accounts.find((a) => a.id === activeAccountId) ??
+      accounts[0];
     const low = accounts.some((a) => a.primaryPct <= 25);
     return {
-      avgPct: avg,
-      lowestLabel: `最低项：${lowest.alias} ${lowest.primaryPct}%`,
+      spotlightAccount: spot,
       hasLowAlert: low,
     };
-  }, [accounts]);
+  }, [accounts, pinnedAccountId, activeAccountId]);
 
   const handleSwitchMode = async (next: WindowMode) => {
     setMode(next);
@@ -173,9 +180,8 @@ export const App: React.FC = () => {
     setRefreshingAll(true);
     try {
       const snap = await refreshAllQuotas();
-      setAccounts(snap.accounts);
-      setLastUpdatedAt(snap.lastUpdatedAt);
-      showToast('已刷新全部账号额度');
+      applySnapshot(snap);
+      showToast('已刷新全部已有账号额度');
     } catch (e) {
       showToast(`刷新失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -186,17 +192,30 @@ export const App: React.FC = () => {
   const handleRefreshSingle = async (id: string) => {
     try {
       const updated = await refreshSingleAccount(id);
-      setAccounts((prev) => prev.map((a) => (a.id === id ? updated : a)));
+      const snap = await getQuotaSnapshot();
+      applySnapshot(snap);
       showToast(`已同步 ${updated.alias}`);
     } catch (e) {
       showToast(`同步失败：${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
+  const handleTogglePin = async (id: string) => {
+    try {
+      const wasPinned = pinnedAccountId === id;
+      const snap = await togglePinAccount(id);
+      applySnapshot(snap);
+      showToast(wasPinned ? '已取消固定，恢复自动跟随当前使用应用' : '已置顶为主焦点');
+    } catch (e) {
+      showToast(`置顶切换失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
   const handleRemove = async (id: string) => {
     const ok = await removeAccount(id);
     if (ok) {
-      setAccounts((prev) => prev.filter((a) => a.id !== id));
+      const snap = await getQuotaSnapshot();
+      applySnapshot(snap);
       showToast('已移除该监控账号');
     }
   };
@@ -207,7 +226,7 @@ export const App: React.FC = () => {
     if (authCount > 0) {
       return `本机扫描完成：发现 ${foundAccounts.length} 个账号（${okCount} 个已同步，${authCount} 个需重登）`;
     }
-    return `本机扫描完成：已同步 ${foundAccounts.length} 个本机账号`;
+    return `本机扫描完成：已同步 ${foundAccounts.length} 个有效账号`;
   };
 
   const handleScanLocalAll = async () => {
@@ -218,15 +237,11 @@ export const App: React.FC = () => {
         .map((item) => item.account!);
       if (foundAccounts.length > 0) {
         const snap = await getQuotaSnapshot();
-        setAccounts(snap.accounts);
-        setLastUpdatedAt(snap.lastUpdatedAt);
-        setFilterPlatform('all');
-        setFilterTier('all');
-        setExpandedId(foundAccounts[0].id);
+        applySnapshot(snap);
         showToast(formatScanToast(foundAccounts));
       } else {
         setSettingsOpen(true);
-        showToast('未检测到本地客户端凭据，可在设置查看各平台详情');
+        showToast('未检测到可用的本地客户端凭据，已忽略无效残留');
       }
     } catch (e) {
       showToast(e instanceof Error ? e.message : String(e));
@@ -235,14 +250,13 @@ export const App: React.FC = () => {
 
   const handleClearDemo = async () => {
     const snap = await clearDemoAccounts();
-    setAccounts(snap.accounts);
+    applySnapshot(snap);
     showToast('已清空示例账号');
   };
 
   const handleRestoreDemo = async () => {
     const snap = await restoreDemoAccounts();
-    setAccounts(snap.accounts);
-    if (snap.accounts[0]) setExpandedId(snap.accounts[0].id);
+    applySnapshot(snap);
     showToast('已恢复示例预览数据');
   };
 
@@ -265,8 +279,7 @@ export const App: React.FC = () => {
       try {
         const res = await detectAntigravityLocal(acc.alias);
         const snap = await getQuotaSnapshot();
-        setAccounts(snap.accounts);
-        setLastUpdatedAt(snap.lastUpdatedAt);
+        applySnapshot(snap);
         showToast(res.message);
       } catch (e) {
         showToast(e instanceof Error ? e.message : String(e));
@@ -291,7 +304,7 @@ export const App: React.FC = () => {
         rebindTarget.account.id
       );
       const snap = await refreshAllQuotas();
-      setAccounts(snap.accounts);
+      applySnapshot(snap);
       setRebindTarget(null);
       showToast(`已更新 ${rebindTarget.account.alias} 会话`);
     } catch (e) {
@@ -303,8 +316,7 @@ export const App: React.FC = () => {
     if (mode === 'orb') {
       return (
         <OrbView
-          avgPct={avgPct}
-          lowestLabel={lowestLabel}
+          activeAccount={spotlightAccount}
           onExpand={() => void handleSwitchMode('panel')}
         />
       );
@@ -312,7 +324,7 @@ export const App: React.FC = () => {
     if (mode === 'edge') {
       return (
         <EdgeDockView
-          avgPct={avgPct}
+          activeAccount={spotlightAccount}
           hasLowAlert={hasLowAlert}
           onExpand={() => void handleSwitchMode('panel')}
         />
@@ -326,27 +338,26 @@ export const App: React.FC = () => {
       >
         <PanelView
           accounts={accounts}
+          activeAccountId={activeAccountId}
+          pinnedAccountId={pinnedAccountId}
+          activeReason={activeReason}
+          lastActiveMap={lastActiveMap}
           lastUpdatedAt={lastUpdatedAt}
-          filterPlatform={filterPlatform}
-          filterTier={filterTier}
           privacy={privacy}
           theme={theme}
           expandedId={expandedId}
           refreshingAll={refreshingAll}
           hasUpdateBadge={Boolean(pendingUpdate?.hasUpdate)}
-          onFilterPlatform={setFilterPlatform}
-          onFilterTier={setFilterTier}
           onTogglePrivacy={() => setPrivacy((p) => !p)}
           onToggleTheme={() => void handleToggleTheme()}
           onToggleExpand={(id) => setExpandedId((cur) => (cur === id ? null : id))}
+          onTogglePin={handleTogglePin}
           onRefreshAll={handleRefreshAll}
           onRefreshSingle={handleRefreshSingle}
           onReauth={handleReauth}
           onRemoveAccount={handleRemove}
           onOpenAddModal={() => {
-            setAddDefaultPlatform(
-              filterPlatform === 'all' ? 'antigravity' : filterPlatform
-            );
+            setAddDefaultPlatform(spotlightAccount?.platform ?? 'antigravity');
             setAddInitialMode(undefined);
             setRebindOAuthAccount(null);
             setAddOpen(true);
@@ -375,19 +386,10 @@ export const App: React.FC = () => {
           setRebindOAuthAccount(null);
           setAddInitialMode(undefined);
         }}
-        onAdded={(acc, msg) => {
+        onAdded={(_acc, msg) => {
           void getQuotaSnapshot().then((snap) => {
-            setAccounts(snap.accounts);
-            setLastUpdatedAt(snap.lastUpdatedAt);
+            applySnapshot(snap);
           });
-          setAccounts((prev) => [acc, ...prev.filter((a) => a.id !== acc.id)]);
-          if (filterPlatform !== 'all' && filterPlatform !== acc.platform) {
-            setFilterPlatform('all');
-          }
-          if (filterTier !== 'all' && filterTier !== acc.tier) {
-            setFilterTier('all');
-          }
-          setExpandedId(acc.id);
           setAddOpen(false);
           setRebindOAuthAccount(null);
           setAddInitialMode(undefined);
@@ -403,16 +405,8 @@ export const App: React.FC = () => {
         onScanImported={(foundAccounts, count) => {
           if (foundAccounts.length > 0) {
             void getQuotaSnapshot().then((snap) => {
-              setAccounts(snap.accounts);
-              setLastUpdatedAt(snap.lastUpdatedAt);
+              applySnapshot(snap);
             });
-            setAccounts((prev) => {
-              const ids = new Set(foundAccounts.map((a) => a.id));
-              return [...foundAccounts, ...prev.filter((a) => !ids.has(a.id))];
-            });
-            setFilterPlatform('all');
-            setFilterTier('all');
-            setExpandedId(foundAccounts[0].id);
             showToast(formatScanToast(foundAccounts));
           } else {
             showToast(`本机扫描完成：发现 ${count} 个客户端`);

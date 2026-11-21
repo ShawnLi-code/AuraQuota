@@ -1,13 +1,38 @@
 import React, { useRef } from 'react';
 import { snapOrbToEdge, startWindowDragging } from '../api/tauriClient';
+import { AccountQuota, PLATFORMS, PlatformId } from '../types';
 
 interface OrbViewProps {
-  avgPct: number;
-  lowestLabel: string;
+  activeAccount: AccountQuota | null;
   onExpand: () => void;
 }
 
-export const OrbView: React.FC<OrbViewProps> = ({ avgPct, lowestLabel, onExpand }) => {
+function shortOrbLabel(platform?: PlatformId): string {
+  switch (platform) {
+    case 'antigravity':
+      return '反重力';
+    case 'gemini':
+      return 'Gemini';
+    case 'codex':
+      return 'Codex';
+    case 'claude':
+      return 'Claude';
+    case 'commandcode':
+      return 'CC';
+    case 'opencode':
+      return 'OC Go';
+    default:
+      return 'AI额度';
+  }
+}
+
+function orbStrokeColors(pct: number): [string, string] {
+  if (pct <= 25) return ['#fb7185', '#f97316'];
+  if (pct <= 55) return ['#fbbf24', '#f59e0b'];
+  return ['#2dd4bf', '#38bdf8'];
+}
+
+export const OrbView: React.FC<OrbViewProps> = ({ activeAccount, onExpand }) => {
   const dragRef = useRef<{
     down: boolean;
     startedNativeDrag: boolean;
@@ -20,8 +45,13 @@ export const OrbView: React.FC<OrbViewProps> = ({ avgPct, lowestLabel, onExpand 
     startY: 0,
   });
 
+  const pct = activeAccount ? activeAccount.primaryPct : 0;
+  const label = shortOrbLabel(activeAccount?.platform);
+  const pInfo = activeAccount ? PLATFORMS[activeAccount.platform] : null;
+  const [c1, c2] = orbStrokeColors(pct);
+
   const circumference = 150.8;
-  const dashOffset = (circumference * (1 - avgPct / 100)).toFixed(1);
+  const dashOffset = (circumference * (1 - pct / 100)).toFixed(1);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
     if (e.button !== 0) return;
@@ -43,7 +73,6 @@ export const OrbView: React.FC<OrbViewProps> = ({ avgPct, lowestLabel, onExpand 
       try {
         await startWindowDragging();
       } finally {
-        // After Windows native drag concludes, snap cleanly to screen edge
         setTimeout(() => {
           void snapOrbToEdge();
         }, 60);
@@ -66,12 +95,19 @@ export const OrbView: React.FC<OrbViewProps> = ({ avgPct, lowestLabel, onExpand 
     }
   };
 
+  const tip = activeAccount
+    ? `当前活跃：${pInfo?.name ?? ''} · ${activeAccount.alias} (${pct}% · ${activeAccount.resetIn}) — 点击展开，拖动吸附边缘`
+    : 'AuraQuota — 点击展开添加监控账号';
+
   return (
     <div className="w-[72px] h-[72px] flex items-center justify-center relative">
       <div className="relative">
         <div
           aria-hidden="true"
-          className="orb-halo absolute inset-0 rounded-full bg-gradient-to-tr from-sky-400/45 via-indigo-400/45 to-fuchsia-400/45 blur-sm pointer-events-none"
+          className="orb-halo absolute inset-0 rounded-full blur-sm pointer-events-none"
+          style={{
+            background: `linear-gradient(135deg, ${c1}55, ${c2}55)`,
+          }}
         />
         <button
           type="button"
@@ -79,16 +115,15 @@ export const OrbView: React.FC<OrbViewProps> = ({ avgPct, lowestLabel, onExpand 
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onClick={handleClick}
-          title={`综合可用额度 ${avgPct}% · ${lowestLabel}（点击展开，拖动吸附边缘）`}
-          aria-label={`展开额度面板，当前综合可用额度 ${avgPct}%`}
+          title={tip}
+          aria-label={tip}
           className="orb-btn glass-surface flex items-center justify-center"
         >
           <svg className="w-14 h-14 -rotate-90" viewBox="0 0 60 60" aria-hidden="true">
             <defs>
-              <linearGradient id="orbGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                <stop offset="0%" stopColor="#38bdf8" />
-                <stop offset="55%" stopColor="#818cf8" />
-                <stop offset="100%" stopColor="#c084fc" />
+              <linearGradient id="orbGradActive" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stopColor={c1} />
+                <stop offset="100%" stopColor={c2} />
               </linearGradient>
             </defs>
             <circle
@@ -104,7 +139,7 @@ export const OrbView: React.FC<OrbViewProps> = ({ avgPct, lowestLabel, onExpand 
               cy="30"
               r="24"
               fill="none"
-              stroke="url(#orbGrad)"
+              stroke="url(#orbGradActive)"
               strokeWidth="4"
               strokeLinecap="round"
               strokeDasharray={circumference}
@@ -113,8 +148,15 @@ export const OrbView: React.FC<OrbViewProps> = ({ avgPct, lowestLabel, onExpand 
             />
           </svg>
           <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-            <span className="text-sm font-bold leading-none">{avgPct}%</span>
-            <span className="text-[9px] mt-0.5 opacity-75">AI额度</span>
+            <span className="text-sm font-bold leading-none tabular-nums">
+              {activeAccount ? `${pct}%` : '--'}
+            </span>
+            <span
+              className="text-[9px] mt-0.5 font-medium truncate max-w-[44px]"
+              style={{ color: activeAccount ? c2 : 'var(--text-sub)' }}
+            >
+              {label}
+            </span>
           </div>
         </button>
       </div>
