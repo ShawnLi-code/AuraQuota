@@ -43,6 +43,10 @@ export const AccountCard: React.FC<AccountCardProps> = ({
 }) => {
   const [refreshing, setRefreshing] = useState(false);
   const pInfo = PLATFORMS[account.platform];
+  const dupPrefix = `${pInfo.name} · `;
+  const displayAlias = account.alias.startsWith(dupPrefix)
+    ? account.alias.slice(dupPrefix.length)
+    : account.alias;
 
   const handleRefreshClick = async () => {
     setRefreshing(true);
@@ -104,7 +108,7 @@ export const AccountCard: React.FC<AccountCardProps> = ({
               }}
             />
             <span className="text-[12.5px] font-semibold truncate">
-              {pInfo.name} · {account.alias}
+              {pInfo.name} · {displayAlias}
             </span>
             {account.tier === 'paid' ? (
               <span

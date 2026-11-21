@@ -69,7 +69,8 @@ pub fn read_sqlite_auth_rows(vscdb_path: &Path) -> Result<Vec<(String, String)>,
         .prepare(
             "SELECT key, CAST(value AS TEXT) FROM ItemTable \
              WHERE key LIKE '%antigravity%' OR key LIKE '%auth%' \
-             OR key LIKE '%oauth%' OR key LIKE '%jetski%'",
+             OR key LIKE '%oauth%' OR key LIKE '%jetski%' \
+             OR key LIKE '%gemini%' OR key LIKE '%token%'",
         )
         .map_err(|e| format!("查询 ItemTable 失败: {e}"))?;
 
@@ -105,9 +106,17 @@ fn row_priority(key: &str) -> u8 {
 
 #[derive(Default)]
 struct ExtractedFragments {
-    access_token: Option<String>,
+    access_tokens: Vec<String>,
     refresh_token: Option<String>,
     email: Option<String>,
+}
+
+impl ExtractedFragments {
+    fn push_access_token(&mut self, tok: String) {
+        if !tok.is_empty() && !self.access_tokens.iter().any(|t| t == &tok) {
+            self.access_tokens.push(tok);
+        }
+    }
 }
 
 fn collect_fragments_from_value(
@@ -122,8 +131,8 @@ fn collect_fragments_from_value(
     if out.email.is_none() {
         out.email = find_email_ascii(raw);
     }
-    if out.access_token.is_none() {
-        out.access_token = extract_prefixed_token(raw, "ya29.", 25);
+    for tok in extract_all_prefixed_tokens(raw, "ya29.", 25) {
+        out.push_access_token(tok);
     }
     if out.refresh_token.is_none() {
         out.refresh_token = extract_prefixed_token(raw, "1//", 24);
@@ -142,19 +151,17 @@ fn collect_fragments_from_value(
         }
 
         // Also scan embedded ASCII base64 runs inside binary protobuf / mixed text
-        if out.access_token.is_none() || out.refresh_token.is_none() {
-            for run in raw.split(|c: char| {
-                !c.is_ascii_alphanumeric() && !matches!(c, '+' | '/' | '=' | '-' | '_')
-            }) {
-                if run.len() >= 32
-                    && run.len() < raw.len()
-                    && !run.starts_with("ya29.")
-                    && !run.starts_with("1//")
-                {
-                    if let Some(decoded) = decode_b64_to_utf8(run) {
-                        if &decoded != run {
-                            collect_fragments_from_value(&decoded, depth + 1, out);
-                        }
+        for run in raw.split(|c: char| {
+            !c.is_ascii_alphanumeric() && !matches!(c, '+' | '/' | '=' | '-' | '_')
+        }) {
+            if run.len() >= 32
+                && run.len() < raw.len()
+                && !run.starts_with("ya29.")
+                && !run.starts_with("1//")
+            {
+                if let Some(decoded) = decode_b64_to_utf8(run) {
+                    if &decoded != run {
+                        collect_fragments_from_value(&decoded, depth + 1, out);
                     }
                 }
             }
@@ -172,20 +179,20 @@ fn collect_fragments_from_json(json: &Value, depth: u8, out: &mut ExtractedFragm
             .filter(|s| s.contains('@'))
             .map(str::to_string);
     }
-    if out.access_token.is_none() {
-        out.access_token = json
-            .get("accessToken")
-            .or_else(|| json.get("access_token"))
-            .or_else(|| json.get("oauthToken"))
-            .or_else(|| json.pointer("/token/accessToken"))
-            .or_else(|| json.pointer("/oauthToken/accessToken"))
-            .or_else(|| {
-                json.get("apiKey")
-                    .filter(|v| v.as_str().is_some_and(|s| s.starts_with("ya29.")))
-            })
-            .and_then(|v| v.as_str())
-            .filter(|s| s.len() > 20)
-            .map(str::to_string);
+    if let Some(tok) = json
+        .get("accessToken")
+        .or_else(|| json.get("access_token"))
+        .or_else(|| json.get("oauthToken"))
+        .or_else(|| json.pointer("/token/accessToken"))
+        .or_else(|| json.pointer("/oauthToken/accessToken"))
+        .or_else(|| {
+            json.get("apiKey")
+                .filter(|v| v.as_str().is_some_and(|s| s.starts_with("ya29.")))
+        })
+        .and_then(|v| v.as_str())
+        .filter(|s| s.len() > 20)
+    {
+        out.push_access_token(tok.to_string());
     }
     if out.refresh_token.is_none() {
         out.refresh_token = json
@@ -214,10 +221,8 @@ fn collect_fragments_from_json(json: &Value, depth: u8, out: &mut ExtractedFragm
             }
         }
         Value::String(s) => {
-            if let Some(tok) = extract_prefixed_token(s, "ya29.", 25) {
-                if out.access_token.is_none() {
-                    out.access_token = Some(tok);
-                }
+            for tok in extract_all_prefixed_tokens(s, "ya29.", 25) {
+                out.push_access_token(tok);
             }
             if let Some(rtok) = extract_prefixed_token(s, "1//", 24) {
                 if out.refresh_token.is_none() {
@@ -227,10 +232,7 @@ fn collect_fragments_from_json(json: &Value, depth: u8, out: &mut ExtractedFragm
             if out.email.is_none() {
                 out.email = find_email_ascii(s);
             }
-            if (out.access_token.is_none() || out.refresh_token.is_none())
-                && s.len() >= 24
-                && !s.contains(' ')
-            {
+            if s.len() >= 24 && !s.contains(' ') {
                 if let Some(decoded) = decode_b64_to_utf8(s) {
                     if &decoded != s {
                         collect_fragments_from_value(&decoded, depth + 1, out);
@@ -261,7 +263,9 @@ pub fn decode_credential_blob(bytes: &[u8]) -> Option<AntigravityExtractedAuth> 
     let mut frag = ExtractedFragments::default();
     collect_fragments_from_value(&utf8_text, 0, &mut frag);
 
-    if (frag.access_token.is_none() || frag.email.is_none()) && bytes.len() >= 4 && bytes.len() % 2 == 0
+    if (frag.access_tokens.is_empty() || frag.email.is_none())
+        && bytes.len() >= 4
+        && bytes.len() % 2 == 0
     {
         let looks_utf16le = bytes
             .iter()
@@ -281,11 +285,14 @@ pub fn decode_credential_blob(bytes: &[u8]) -> Option<AntigravityExtractedAuth> 
         }
     }
 
-    frag.access_token.map(|tok| AntigravityExtractedAuth {
-        access_token: tok,
-        refresh_token: frag.refresh_token,
-        email: frag.email,
-    })
+    frag.access_tokens
+        .into_iter()
+        .next()
+        .map(|tok| AntigravityExtractedAuth {
+            access_token: tok,
+            refresh_token: frag.refresh_token,
+            email: frag.email,
+        })
 }
 
 #[cfg(windows)]
@@ -398,19 +405,19 @@ pub fn extract_antigravity_candidates_from_rows(
             fallback_refresh = frag.refresh_token.clone();
         }
 
-        if let Some(tok) = frag.access_token {
+        for tok in frag.access_tokens {
             if let Some(existing) = candidates.iter_mut().find(|c| c.access_token == tok) {
                 if existing.refresh_token.is_none() {
-                    existing.refresh_token = frag.refresh_token;
+                    existing.refresh_token = frag.refresh_token.clone();
                 }
                 if existing.email.is_none() {
-                    existing.email = frag.email;
+                    existing.email = frag.email.clone();
                 }
             } else {
                 candidates.push(AntigravityExtractedAuth {
                     access_token: tok,
-                    refresh_token: frag.refresh_token,
-                    email: frag.email,
+                    refresh_token: frag.refresh_token.clone(),
+                    email: frag.email.clone(),
                 });
             }
         }
@@ -437,7 +444,8 @@ pub fn extract_antigravity_auth_from_rows(
         .map(|c| (c.access_token, c.email))
 }
 
-fn extract_prefixed_token(text: &str, prefix: &str, min_len: usize) -> Option<String> {
+fn extract_all_prefixed_tokens(text: &str, prefix: &str, min_len: usize) -> Vec<String> {
+    let mut out = Vec::new();
     let mut offset = 0usize;
     while let Some(rel_idx) = text[offset..].find(prefix) {
         let idx = offset + rel_idx;
@@ -446,12 +454,18 @@ fn extract_prefixed_token(text: &str, prefix: &str, min_len: usize) -> Option<St
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
             .collect();
-        if tok.len() >= min_len {
-            return Some(tok);
+        if tok.len() >= min_len && !out.iter().any(|t| t == &tok) {
+            out.push(tok);
         }
         offset = idx + prefix.len();
     }
-    None
+    out
+}
+
+fn extract_prefixed_token(text: &str, prefix: &str, min_len: usize) -> Option<String> {
+    extract_all_prefixed_tokens(text, prefix, min_len)
+        .into_iter()
+        .next()
 }
 
 fn find_email_ascii(text: &str) -> Option<String> {

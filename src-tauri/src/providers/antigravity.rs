@@ -7,10 +7,11 @@ use crate::providers::{
     clamp_pct, format_reset_countdown, make_error_quota, now_hh_mm, ProviderContext, QuotaProvider,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -58,14 +59,13 @@ impl AntigravityProvider {
             .map_err(|e| (AccountStatus::Offline, format!("本地检测任务异常: {e}")))?
             .map_err(|e| (AccountStatus::Offline, e))?;
 
-        let rpc_paths = [
-            "/exa.language_server_pb.LanguageServerService/GetUserStatus",
-            "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
-            "/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs",
-        ];
+        let rpc_summary = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
+        let rpc_status = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+        let rpc_configs = "/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs";
+
         let request_bodies = [
-            r#"{"metadata":{"ideName":"antigravity","extensionName":"antigravity","locale":"en"}}"#,
             "{}",
+            r#"{"metadata":{"ideName":"antigravity","extensionName":"antigravity","locale":"en"}}"#,
         ];
 
         let mut total_ports = 0usize;
@@ -76,9 +76,23 @@ impl AntigravityProvider {
             for port in &info.ports {
                 for host in ["127.0.0.1", "[::1]"] {
                     for scheme in ["https", "http"] {
-                        'path_loop: for path in &rpc_paths {
+                        let base = format!("{scheme}://{host}:{port}");
+                        let mut summary_json: Option<Value> = None;
+                        let mut status_json: Option<Value> = None;
+                        let mut connection_dead = false;
+
+                        for path in [rpc_summary, rpc_status, rpc_configs] {
+                            if connection_dead {
+                                break;
+                            }
+                            // Once RetrieveUserQuotaSummary succeeds AND we already hit GetUserStatus, stop
+                            if path == rpc_configs
+                                && (summary_json.is_some() || status_json.is_some())
+                            {
+                                break;
+                            }
                             for body in &request_bodies {
-                                let url = format!("{scheme}://{host}:{port}{path}");
+                                let url = format!("{base}{path}");
                                 let resp = self
                                     .loopback_client
                                     .post(&url)
@@ -94,10 +108,20 @@ impl AntigravityProvider {
                                         let status = r.status();
                                         if status.is_success() {
                                             if let Ok(json) = r.json::<Value>().await {
-                                                if let Some(quota) =
-                                                    parse_antigravity_quota(record, &json)
-                                                {
-                                                    return Ok(quota);
+                                                if path == rpc_summary {
+                                                    if has_quota_data(&json) {
+                                                        summary_json = Some(json);
+                                                        break;
+                                                    }
+                                                } else if path == rpc_status {
+                                                    if has_quota_data(&json) || has_user_meta(&json)
+                                                    {
+                                                        status_json = Some(json);
+                                                        break;
+                                                    }
+                                                } else if has_quota_data(&json) {
+                                                    status_json = Some(json);
+                                                    break;
                                                 }
                                             }
                                         } else {
@@ -106,10 +130,21 @@ impl AntigravityProvider {
                                     }
                                     Err(e) => {
                                         if e.is_connect() || e.is_timeout() {
-                                            break 'path_loop;
+                                            connection_dead = true;
+                                            break;
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        if summary_json.is_some() || status_json.is_some() {
+                            if let Some(quota) = merge_antigravity_quotas(
+                                record,
+                                summary_json.as_ref(),
+                                status_json.as_ref(),
+                            ) {
+                                return Ok(quota);
                             }
                         }
                     }
@@ -181,6 +216,7 @@ impl AntigravityProvider {
     ) -> Result<AccountQuota, (AccountStatus, String)> {
         let base_urls = [
             "https://cloudcode-pa.googleapis.com",
+            "https://daily-cloudcode-pa.googleapis.com",
             "https://daily-cloudcode-pa.sandbox.googleapis.com",
         ];
 
@@ -194,65 +230,86 @@ impl AntigravityProvider {
                 None => "{}".to_string(),
             };
 
-            let endpoints = [
-                (format!("{base}/v1internal:fetchAvailableModels"), req_body),
-                (
-                    format!("{base}/v1internal:retrieveUserQuotaSummary"),
-                    "{}".to_string(),
-                ),
-            ];
+            let mut summary_json: Option<Value> = None;
+            let mut models_json: Option<Value> = None;
 
-            for (url, body_str) in endpoints {
-                let resp = self
+            for url_body in [
+                (format!("{base}/v1internal:retrieveUserQuotaSummary"), req_body.clone()),
+                (format!("{base}/v1internal:retrieveUserQuotaSummary"), "{}".to_string()),
+            ] {
+                if summary_json.is_some() {
+                    break;
+                }
+                if let Ok(r) = self
                     .cloud_client
-                    .post(&url)
+                    .post(&url_body.0)
                     .bearer_auth(token)
                     .header("Content-Type", "application/json")
-                    .body(body_str)
+                    .body(url_body.1)
                     .send()
-                    .await;
-
-                match resp {
-                    Ok(r) => {
-                        let status = r.status();
-                        if status.as_u16() == 401 || status.as_u16() == 403 {
-                            saw_auth_error = true;
-                            continue;
-                        }
-                        if status.is_success() {
-                            if let Ok(json) = r.json::<Value>().await {
-                                if let Some(mut quota) = parse_antigravity_quota(record, &json) {
-                                    if let Some(ref tier_raw) = assist_tier {
-                                        let (t, lbl) = normalize_agy_plan(
-                                            tier_raw,
-                                            quota.tier,
-                                            &quota.plan_label,
-                                        );
-                                        quota.tier = t;
-                                        quota.plan_label = lbl;
-                                    }
-                                    if quota.email.is_empty()
-                                        || quota.email == "local@antigravity"
-                                        || quota.email == "account@local"
-                                    {
-                                        if let Some(email) =
-                                            fetch_google_userinfo_email(&self.cloud_client, token)
-                                                .await
-                                        {
-                                            quota.email = email;
-                                        }
-                                    }
-                                    return Ok(quota);
-                                }
+                    .await
+                {
+                    if r.status().as_u16() == 401 || r.status().as_u16() == 403 {
+                        saw_auth_error = true;
+                    } else if r.status().is_success() {
+                        if let Ok(j) = r.json::<Value>().await {
+                            if has_quota_data(&j) {
+                                summary_json = Some(j);
                             }
-                        } else {
-                            last_err = format!("Cloud Code API 返回 HTTP {}", status.as_u16());
                         }
-                    }
-                    Err(e) => {
-                        last_err = format!("请求失败: {e}");
                     }
                 }
+            }
+
+            let models_url = format!("{base}/v1internal:fetchAvailableModels");
+            match self
+                .cloud_client
+                .post(&models_url)
+                .bearer_auth(token)
+                .header("Content-Type", "application/json")
+                .body(req_body)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let status = r.status();
+                    if status.as_u16() == 401 || status.as_u16() == 403 {
+                        saw_auth_error = true;
+                    } else if status.is_success() {
+                        if let Ok(j) = r.json::<Value>().await {
+                            if has_quota_data(&j) {
+                                models_json = Some(j);
+                            }
+                        }
+                    } else {
+                        last_err = format!("Cloud Code API 返回 HTTP {}", status.as_u16());
+                    }
+                }
+                Err(e) => {
+                    last_err = format!("请求失败: {e}");
+                }
+            }
+
+            if let Some(mut quota) =
+                merge_antigravity_quotas(record, summary_json.as_ref(), models_json.as_ref())
+            {
+                if let Some(ref tier_raw) = assist_tier {
+                    let (t, lbl) =
+                        normalize_agy_plan(tier_raw, quota.tier, &quota.plan_label);
+                    quota.tier = t;
+                    quota.plan_label = lbl;
+                }
+                if quota.email.is_empty()
+                    || quota.email == "local@antigravity"
+                    || quota.email == "account@local"
+                {
+                    if let Some(email) =
+                        fetch_google_userinfo_email(&self.cloud_client, token).await
+                    {
+                        quota.email = email;
+                    }
+                }
+                return Ok(quota);
             }
         }
 
@@ -409,7 +466,10 @@ impl QuotaProvider for AntigravityProvider {
                             Err(_) => None,
                         };
                         let local_err = match other_res {
-                            Ok(q) => format!("本机当前登录为 {}，请切回 {}", q.email, record.email),
+                            Ok(q) => format!(
+                                "本机当前已切至 {}；{} 会话已登出或不可用，请在 Antigravity 切回后刷新",
+                                q.email, record.email
+                            ),
                             Err((_, e)) => e,
                         };
 
@@ -746,247 +806,442 @@ fn split_cmd_tokens(cmd: &str) -> Vec<String> {
     out
 }
 
-pub fn parse_antigravity_quota(
-    record: &StoredAccountRecord,
-    json: &Value,
-) -> Option<AccountQuota> {
-    let mut gemini_pcts: Vec<(f64, Option<String>)> = Vec::new();
-    let mut third_party_pcts: Vec<(f64, Option<String>)> = Vec::new();
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum AgyCategory {
+    Gemini,
+    Argon,
+    ClaudeGpt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AgyWindow {
+    FiveHour,
+    Weekly,
+    Unspecified,
+}
+
+#[derive(Debug, Clone)]
+struct AgyQuotaEntry {
+    category: AgyCategory,
+    window: AgyWindow,
+    pct: f64,
+    reset_time: Option<String>,
+}
+
+fn classify_agy_category(raw: &str) -> AgyCategory {
+    let lower = raw.to_lowercase();
+    // 必须优先匹配 Argon / Agron，因为模型名可能形如 gemini-4-argon
+    if lower.contains("argon") || lower.contains("agron") {
+        AgyCategory::Argon
+    } else if lower.contains("claude")
+        || lower.contains("gpt")
+        || lower.contains("3p")
+        || lower.contains("anthropic")
+        || lower.contains("openai")
+        || lower.contains("opus")
+        || lower.contains("sonnet")
+        || lower.contains("haiku")
+    {
+        AgyCategory::ClaudeGpt
+    } else {
+        AgyCategory::Gemini
+    }
+}
+
+fn classify_agy_window(
+    label: &str,
+    reset_iso: Option<&str>,
+    category: &AgyCategory,
+) -> AgyWindow {
+    let lower = label.to_lowercase();
+    if lower.contains("weekly")
+        || lower.contains("week")
+        || lower.contains("7d")
+        || lower.contains("7_day")
+        || lower.contains("7-day")
+        || lower.contains("7 day")
+        || lower.contains("168h")
+        || lower.contains("周")
+    {
+        return AgyWindow::Weekly;
+    }
+    if lower.contains("5h")
+        || lower.contains("5_h")
+        || lower.contains("5-h")
+        || lower.contains("5_hour")
+        || lower.contains("5-hour")
+        || lower.contains("5 hour")
+        || lower.contains("five_hour")
+        || lower.contains("five-hour")
+        || lower.contains("five hour")
+        || lower.contains("fivehour")
+        || lower.contains("short")
+    {
+        return AgyWindow::FiveHour;
+    }
+
+    if let Some(iso) = reset_iso.filter(|s| !s.is_empty()) {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
+            let secs = (dt.with_timezone(&Utc) - Utc::now()).num_seconds();
+            if secs > 0 {
+                let hours = secs as f64 / 3600.0;
+                if hours > 6.0 && hours <= 192.0 {
+                    return AgyWindow::Weekly;
+                }
+                if hours <= 6.0 {
+                    return AgyWindow::FiveHour;
+                }
+            }
+        }
+    }
+
+    match category {
+        AgyCategory::Gemini => AgyWindow::FiveHour,
+        AgyCategory::ClaudeGpt => AgyWindow::Weekly,
+        AgyCategory::Argon => AgyWindow::Unspecified,
+    }
+}
+
+fn format_agy_pool_name(category: &AgyCategory, window: AgyWindow) -> String {
+    match (category, window) {
+        (AgyCategory::Gemini, AgyWindow::FiveHour) => "Gemini 模型池 (5h)".to_string(),
+        (AgyCategory::Gemini, AgyWindow::Weekly) => "Gemini 模型池 (周)".to_string(),
+        (AgyCategory::Gemini, AgyWindow::Unspecified) => "Gemini 模型池".to_string(),
+        (AgyCategory::Argon, AgyWindow::FiveHour) => "Argon 模型池 (5h)".to_string(),
+        (AgyCategory::Argon, AgyWindow::Weekly) => "Argon 模型池 (周)".to_string(),
+        (AgyCategory::Argon, AgyWindow::Unspecified) => "Argon 模型池".to_string(),
+        (AgyCategory::ClaudeGpt, AgyWindow::FiveHour) => "Claude / GPT 池 (5h)".to_string(),
+        (AgyCategory::ClaudeGpt, AgyWindow::Weekly) => "Claude / GPT 池 (周)".to_string(),
+        (AgyCategory::ClaudeGpt, AgyWindow::Unspecified) => "Claude / GPT 池".to_string(),
+    }
+}
+
+fn extract_object_label_tokens(obj: &Value) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "displayName",
+        "display_name",
+        "title",
+        "label",
+        "name",
+        "groupId",
+        "group_id",
+        "bucketId",
+        "bucket_id",
+        "id",
+        "window",
+        "period",
+        "duration",
+        "model",
+    ] {
+        if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                parts.push(s.to_string());
+            }
+        }
+    }
+    if let Some(m) = obj.pointer("/modelOrAlias/model").and_then(|v| v.as_str()) {
+        if !m.is_empty() {
+            parts.push(m.to_string());
+        }
+    }
+    for arr_key in ["models", "modelIds", "model_ids"] {
+        if let Some(arr) = obj.get(arr_key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    parts.push(s.to_string());
+                } else if let Some(s) = item
+                    .get("model")
+                    .or_else(|| item.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    parts.push(s.to_string());
+                }
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+fn extract_bucket_pct_and_reset(obj: &Value) -> Option<(f64, Option<String>)> {
+    let reset = obj
+        .get("resetTime")
+        .or_else(|| obj.get("reset_time"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let rem = obj
+        .get("remainingFraction")
+        .or_else(|| obj.get("remaining_fraction"))
+        .and_then(|v| v.as_f64())
+        .map(|f| if f <= 1.0 { f * 100.0 } else { f })
+        .or_else(|| {
+            if reset.is_some() {
+                Some(0.0)
+            } else {
+                None
+            }
+        });
+    rem.map(|pct| (pct, reset))
+}
+
+fn collect_structured_entries(json: &Value) -> Vec<AgyQuotaEntry> {
+    let mut entries = Vec::new();
 
     if let Some(groups) = json
         .get("groups")
+        .or_else(|| json.get("quotaGroups"))
         .or_else(|| json.pointer("/response/groups"))
+        .or_else(|| json.pointer("/userQuotaSummary/groups"))
+        .or_else(|| json.pointer("/userQuotaSummary/quotaGroups"))
         .and_then(|v| v.as_array())
     {
         for grp in groups {
-            let group_label = grp
-                .get("displayName")
-                .or_else(|| grp.get("name"))
-                .or_else(|| grp.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-
-            if let Some(buckets) = grp.get("buckets").and_then(|v| v.as_array()) {
-                for b in buckets {
-                    let b_label = b
-                        .get("displayName")
-                        .or_else(|| b.get("bucketId"))
-                        .or_else(|| b.get("id"))
-                        .or_else(|| b.get("window"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    let rem = b
-                        .get("remainingFraction")
-                        .or_else(|| b.get("remaining_fraction"))
-                        .and_then(|v| v.as_f64())
-                        .map(|f| if f <= 1.0 { f * 100.0 } else { f });
-                    let reset = b
-                        .get("resetTime")
-                        .or_else(|| b.get("reset_time"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-
-                    if let Some(pct) = rem {
+            let group_label = extract_object_label_tokens(grp);
+            let buckets = grp
+                .get("buckets")
+                .or_else(|| grp.get("quotaBuckets"))
+                .and_then(|v| v.as_array());
+            if let Some(buckets_arr) = buckets {
+                for b in buckets_arr {
+                    if let Some((pct, reset)) = extract_bucket_pct_and_reset(b) {
+                        let b_label = extract_object_label_tokens(b);
                         let combined = format!("{group_label} {b_label}");
-                        if combined.contains("claude")
-                            || combined.contains("gpt")
-                            || combined.contains("3p")
-                            || combined.contains("anthropic")
-                            || combined.contains("openai")
-                            || combined.contains("weekly")
-                        {
-                            third_party_pcts.push((pct, reset));
-                        } else {
-                            gemini_pcts.push((pct, reset));
-                        }
+                        let category = classify_agy_category(&combined);
+                        let window =
+                            classify_agy_window(&combined, reset.as_deref(), &category);
+                        entries.push(AgyQuotaEntry {
+                            category,
+                            window,
+                            pct,
+                            reset_time: reset,
+                        });
                     }
                 }
+            } else if let Some((pct, reset)) = extract_bucket_pct_and_reset(grp) {
+                let category = classify_agy_category(&group_label);
+                let window = classify_agy_window(&group_label, reset.as_deref(), &category);
+                entries.push(AgyQuotaEntry {
+                    category,
+                    window,
+                    pct,
+                    reset_time: reset,
+                });
             }
         }
     }
 
-    let buckets = json
+    if let Some(arr) = json
         .get("buckets")
         .or_else(|| json.get("quotaBuckets"))
+        .or_else(|| json.pointer("/response/buckets"))
         .or_else(|| json.pointer("/userQuotaSummary/buckets"))
-        .and_then(|v| v.as_array());
-
-    if let Some(arr) = buckets {
+        .or_else(|| json.pointer("/userQuotaSummary/quotaBuckets"))
+        .and_then(|v| v.as_array())
+    {
         for b in arr {
-            let bucket_id = b
-                .get("bucketId")
-                .or_else(|| b.get("displayName"))
-                .or_else(|| b.get("id"))
-                .or_else(|| b.get("window"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let rem = b
-                .get("remainingFraction")
-                .and_then(|v| v.as_f64())
-                .map(|f| if f <= 1.0 { f * 100.0 } else { f });
-            let reset = b
-                .get("resetTime")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-
-            if let Some(pct) = rem {
-                if bucket_id.contains("3p")
-                    || bucket_id.contains("claude")
-                    || bucket_id.contains("gpt")
-                    || bucket_id.contains("weekly")
-                {
-                    third_party_pcts.push((pct, reset));
-                } else {
-                    gemini_pcts.push((pct, reset));
-                }
+            if let Some((pct, reset)) = extract_bucket_pct_and_reset(b) {
+                let b_label = extract_object_label_tokens(b);
+                let category = classify_agy_category(&b_label);
+                let window = classify_agy_window(&b_label, reset.as_deref(), &category);
+                entries.push(AgyQuotaEntry {
+                    category,
+                    window,
+                    pct,
+                    reset_time: reset,
+                });
             }
         }
     }
 
-    let model_configs = json
+    entries
+}
+
+fn collect_model_entries(json: &Value) -> Vec<AgyQuotaEntry> {
+    let mut entries = Vec::new();
+
+    if let Some(arr) = json
         .pointer("/userStatus/cascadeModelConfigData/clientModelConfigs")
         .or_else(|| json.get("clientModelConfigs"))
         .or_else(|| json.get("modelConfigs"))
-        .and_then(|v| v.as_array());
-
-    if let Some(arr) = model_configs {
+        .and_then(|v| v.as_array())
+    {
         for m in arr {
-            let label = m
-                .get("label")
-                .or_else(|| m.pointer("/modelOrAlias/model"))
-                .or_else(|| m.get("model"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let q = m.get("quotaInfo");
-            let reset = q
-                .and_then(|qi| qi.get("resetTime"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let rem = q
-                .and_then(|qi| qi.get("remainingFraction"))
-                .and_then(|v| v.as_f64())
-                .map(|f| if f <= 1.0 { f * 100.0 } else { f })
-                .or_else(|| {
-                    if reset.as_deref().is_some_and(|s| !s.is_empty()) {
-                        Some(0.0)
-                    } else {
-                        None
-                    }
+            let label = extract_object_label_tokens(m);
+            let Some(q) = m.get("quotaInfo") else {
+                continue;
+            };
+            if let Some((pct, reset)) = extract_bucket_pct_and_reset(q) {
+                let category = classify_agy_category(&label);
+                let window = classify_agy_window(&label, reset.as_deref(), &category);
+                entries.push(AgyQuotaEntry {
+                    category,
+                    window,
+                    pct,
+                    reset_time: reset,
                 });
-
-            if let Some(pct) = rem {
-                if label.contains("claude")
-                    || label.contains("gpt")
-                    || label.contains("opus")
-                    || label.contains("sonnet")
-                {
-                    third_party_pcts.push((pct, reset));
-                } else {
-                    gemini_pcts.push((pct, reset));
-                }
             }
         }
     }
 
     if let Some(map) = json.get("models").and_then(|v| v.as_object()) {
         for (name, m) in map {
-            let lower = name.to_lowercase();
-            let q = m.get("quotaInfo");
-            let reset = q
-                .and_then(|qi| qi.get("resetTime"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let rem = q
-                .and_then(|qi| qi.get("remainingFraction"))
-                .and_then(|v| v.as_f64())
-                .map(|f| if f <= 1.0 { f * 100.0 } else { f })
-                .or_else(|| {
-                    if reset.as_deref().is_some_and(|s| !s.is_empty()) {
-                        Some(0.0)
-                    } else {
-                        None
-                    }
+            let extra = extract_object_label_tokens(m);
+            let combined = format!("{name} {extra}");
+            let Some(q) = m.get("quotaInfo") else {
+                continue;
+            };
+            if let Some((pct, reset)) = extract_bucket_pct_and_reset(q) {
+                let category = classify_agy_category(&combined);
+                let window = classify_agy_window(&combined, reset.as_deref(), &category);
+                entries.push(AgyQuotaEntry {
+                    category,
+                    window,
+                    pct,
+                    reset_time: reset,
                 });
-
-            if let Some(pct) = rem {
-                if lower.contains("claude")
-                    || lower.contains("gpt")
-                    || lower.contains("opus")
-                    || lower.contains("sonnet")
-                {
-                    third_party_pcts.push((pct, reset));
-                } else {
-                    gemini_pcts.push((pct, reset));
-                }
             }
         }
     }
 
-    if gemini_pcts.is_empty() && third_party_pcts.is_empty() {
-        return None;
-    }
+    entries
+}
 
-    let mut sub_pools = Vec::new();
-    let mut primary_pct_val: Option<f64> = None;
-    let mut primary_reset: Option<String> = None;
+pub fn has_quota_data(json: &Value) -> bool {
+    !collect_structured_entries(json).is_empty() || !collect_model_entries(json).is_empty()
+}
 
-    if !gemini_pcts.is_empty() {
-        let min_gem = gemini_pcts
-            .iter()
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .cloned()
-            .unwrap();
-        primary_pct_val = Some(min_gem.0);
-        primary_reset = min_gem.1.clone();
-        sub_pools.push(SubPool {
-            name: "Gemini 模型池 (5h)".to_string(),
-            pct: clamp_pct(min_gem.0),
-            detail: None,
-            reset_in: min_gem.1.as_deref().map(format_reset_countdown),
-        });
-    }
+pub(crate) fn has_user_meta(json: &Value) -> bool {
+    extract_email_from_json(json).is_some() || extract_tier_from_json(json).is_some()
+}
 
-    if !third_party_pcts.is_empty() {
-        let min_3p = third_party_pcts
-            .iter()
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .cloned()
-            .unwrap();
-        if primary_pct_val.is_none() {
-            primary_pct_val = Some(min_3p.0);
-            primary_reset = min_3p.1.clone();
-        }
-        sub_pools.push(SubPool {
-            name: "Claude / GPT 池 (周)".to_string(),
-            pct: clamp_pct(min_3p.0),
-            detail: None,
-            reset_in: min_3p.1.as_deref().map(format_reset_countdown),
-        });
-    }
-
-    let detected_email = json
-        .pointer("/userStatus/email")
+fn extract_email_from_json(json: &Value) -> Option<String> {
+    json.pointer("/userStatus/email")
         .or_else(|| json.pointer("/userStatus/user/email"))
         .or_else(|| json.pointer("/user/email"))
         .or_else(|| json.pointer("/account/email"))
         .or_else(|| json.get("email"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "local@antigravity")
         .map(str::to_string)
-        .unwrap_or_else(|| record.email.clone());
+}
 
-    let tier_str = json
-        .pointer("/userStatus/planStatus/planInfo/planName")
+fn extract_tier_from_json(json: &Value) -> Option<String> {
+    json.pointer("/userStatus/planStatus/planInfo/planName")
+        .or_else(|| json.pointer("/userStatus/planStatus/planInfo/planTier"))
         .or_else(|| json.pointer("/userStatus/userTier/name"))
+        .or_else(|| json.pointer("/userStatus/userTier/id"))
+        .or_else(|| json.pointer("/userTier/name"))
         .or_else(|| json.get("planName"))
         .and_then(|v| v.as_str())
-        .unwrap_or(&record.plan_label);
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
 
-    let (tier, plan_label) = normalize_agy_plan(tier_str, record.tier, &record.plan_label);
+pub fn merge_antigravity_quotas(
+    record: &StoredAccountRecord,
+    summary_json: Option<&Value>,
+    models_json: Option<&Value>,
+) -> Option<AccountQuota> {
+    let mut structured = Vec::new();
+    let mut model_only = Vec::new();
+
+    if let Some(j) = summary_json {
+        structured.extend(collect_structured_entries(j));
+        model_only.extend(collect_model_entries(j));
+    }
+    if let Some(j) = models_json {
+        let same_ptr = summary_json.is_some_and(|s| std::ptr::eq(s, j));
+        if !same_ptr {
+            structured.extend(collect_structured_entries(j));
+            model_only.extend(collect_model_entries(j));
+        }
+    }
+
+    let covered_structured_categories: Vec<AgyCategory> = structured
+        .iter()
+        .map(|e| e.category.clone())
+        .collect();
+
+    let mut pool_map: BTreeMap<(AgyCategory, AgyWindow), (f64, Option<String>)> = BTreeMap::new();
+
+    for entry in structured {
+        pool_map
+            .entry((entry.category, entry.window))
+            .and_modify(|cur| {
+                if entry.pct < cur.0 {
+                    *cur = (entry.pct, entry.reset_time.clone());
+                }
+            })
+            .or_insert((entry.pct, entry.reset_time));
+    }
+
+    for entry in model_only {
+        // 若 RetrieveUserQuotaSummary 已按组/时间窗返回某大类额度，不让粗粒度 modelConfigs 覆盖或污染它；
+        // 但若 summary 缺少某大类（例如单独的 Argon 模型池），仍补充进来。
+        if covered_structured_categories.contains(&entry.category) {
+            continue;
+        }
+        pool_map
+            .entry((entry.category, entry.window))
+            .and_modify(|cur| {
+                if entry.pct < cur.0 {
+                    *cur = (entry.pct, entry.reset_time.clone());
+                }
+            })
+            .or_insert((entry.pct, entry.reset_time));
+    }
+
+    if pool_map.is_empty() {
+        return None;
+    }
+
+    let mut sub_pools = Vec::with_capacity(pool_map.len());
+    let mut gemini_primary: Option<(f64, Option<String>)> = None;
+    let mut fallback_primary: Option<(f64, Option<String>)> = None;
+
+    for ((category, window), (pct, reset)) in &pool_map {
+        sub_pools.push(SubPool {
+            name: format_agy_pool_name(category, *window),
+            pct: clamp_pct(*pct),
+            detail: None,
+            reset_in: reset.as_deref().map(format_reset_countdown),
+        });
+
+        if matches!(category, AgyCategory::Gemini) {
+            let replace = gemini_primary
+                .as_ref()
+                .is_none_or(|(cur_pct, _)| *pct < *cur_pct);
+            if replace {
+                gemini_primary = Some((*pct, reset.clone()));
+            }
+        } else {
+            let replace = fallback_primary
+                .as_ref()
+                .is_none_or(|(cur_pct, _)| *pct < *cur_pct);
+            if replace {
+                fallback_primary = Some((*pct, reset.clone()));
+            }
+        }
+    }
+
+    let (primary_pct_val, primary_reset) = gemini_primary
+        .or(fallback_primary)
+        .unwrap_or((100.0, None));
+
+    let detected_email = models_json
+        .and_then(extract_email_from_json)
+        .or_else(|| summary_json.and_then(extract_email_from_json))
+        .unwrap_or_else(|| record.email.clone());
+
+    let tier_str = models_json
+        .and_then(extract_tier_from_json)
+        .or_else(|| summary_json.and_then(extract_tier_from_json))
+        .unwrap_or_else(|| record.plan_label.clone());
+
+    let (tier, plan_label) = normalize_agy_plan(&tier_str, record.tier, &record.plan_label);
 
     Some(AccountQuota {
         id: record.id.clone(),
@@ -995,7 +1250,7 @@ pub fn parse_antigravity_quota(
         email: detected_email,
         tier,
         plan_label,
-        primary_pct: clamp_pct(primary_pct_val.unwrap_or(100.0)),
+        primary_pct: clamp_pct(primary_pct_val),
         reset_in: primary_reset
             .as_deref()
             .map(format_reset_countdown)
@@ -1008,6 +1263,13 @@ pub fn parse_antigravity_quota(
         last_synced_at: Some(now_hh_mm()),
         is_demo: false,
     })
+}
+
+pub fn parse_antigravity_quota(
+    record: &StoredAccountRecord,
+    json: &Value,
+) -> Option<AccountQuota> {
+    merge_antigravity_quotas(record, Some(json), None)
 }
 
 fn normalize_agy_plan(
@@ -1185,6 +1447,170 @@ Active Connections
         assert_eq!(
             extract_flag_value(cmd, &["--extension_server_port"]),
             Some("44123".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_official_dual_window_gemini_and_claude_pools() {
+        let now = Utc::now();
+        let h4 = (now + chrono::Duration::hours(4)).to_rfc3339();
+        let d6 = (now + chrono::Duration::days(6)).to_rfc3339();
+        let d5 = (now + chrono::Duration::days(5)).to_rfc3339();
+        let payload = serde_json::json!({
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        { "bucketId": "five_hour", "displayName": "Five Hour Limit", "remainingFraction": 0.64, "resetTime": h4 },
+                        { "bucketId": "weekly", "displayName": "Weekly Limit", "remainingFraction": 0.90, "resetTime": d6 }
+                    ]
+                },
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        { "bucketId": "five_hour", "displayName": "Five Hour Limit", "remainingFraction": 1.0 },
+                        { "bucketId": "weekly", "displayName": "Weekly Limit", "remainingFraction": 0.99, "resetTime": d5 }
+                    ]
+                }
+            ]
+        });
+
+        let quota = parse_antigravity_quota(&sample_record(), &payload).expect("should parse dual windows");
+        assert_eq!(quota.primary_pct, 64);
+        assert_eq!(quota.sub_pools.len(), 4);
+        assert_eq!(quota.sub_pools[0].name, "Gemini 模型池 (5h)");
+        assert_eq!(quota.sub_pools[0].pct, 64);
+        assert_eq!(quota.sub_pools[1].name, "Gemini 模型池 (周)");
+        assert_eq!(quota.sub_pools[1].pct, 90);
+        assert_eq!(quota.sub_pools[2].name, "Claude / GPT 池 (5h)");
+        assert_eq!(quota.sub_pools[2].pct, 100);
+        assert_eq!(quota.sub_pools[3].name, "Claude / GPT 池 (周)");
+        assert_eq!(quota.sub_pools[3].pct, 99);
+    }
+
+    #[test]
+    fn parses_separate_argon_and_agron_pools() {
+        let now = Utc::now();
+        let h3 = (now + chrono::Duration::hours(3)).to_rfc3339();
+        let payload = serde_json::json!({
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        { "bucketId": "five_hour", "remainingFraction": 0.80 },
+                        { "bucketId": "weekly", "remainingFraction": 0.95 }
+                    ]
+                },
+                {
+                    "displayName": "Gemini 4 Argon",
+                    "buckets": [
+                        { "bucketId": "five_hour", "remainingFraction": 0.42 },
+                        { "bucketId": "weekly", "remainingFraction": 0.77 }
+                    ]
+                },
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        { "bucketId": "weekly", "remainingFraction": 0.88 }
+                    ]
+                }
+            ]
+        });
+
+        let quota = parse_antigravity_quota(&sample_record(), &payload).expect("should parse argon");
+        assert_eq!(quota.primary_pct, 80);
+        let names: Vec<(&str, u8)> = quota
+            .sub_pools
+            .iter()
+            .map(|p| (p.name.as_str(), p.pct))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("Gemini 模型池 (5h)", 80),
+                ("Gemini 模型池 (周)", 95),
+                ("Argon 模型池 (5h)", 42),
+                ("Argon 模型池 (周)", 77),
+                ("Claude / GPT 池 (周)", 88),
+            ]
+        );
+
+        // 也兼容仅含 models 且拼写或模型名为 agron 的情况
+        let agron_payload = serde_json::json!({
+            "models": {
+                "gemini-4-agron": { "quotaInfo": { "remainingFraction": 0.35, "resetTime": h3 } }
+            }
+        });
+        let agron_quota = parse_antigravity_quota(&sample_record(), &agron_payload).expect("agron");
+        assert_eq!(agron_quota.sub_pools[0].name, "Argon 模型池 (5h)");
+        assert_eq!(agron_quota.sub_pools[0].pct, 35);
+    }
+
+    #[test]
+    fn merges_summary_quotas_with_user_status_meta_and_extra_argon_model() {
+        let now = Utc::now();
+        let h3 = (now + chrono::Duration::hours(3)).to_rfc3339();
+        let summary = serde_json::json!({
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        { "bucketId": "five_hour", "remainingFraction": 0.64 },
+                        { "bucketId": "weekly", "remainingFraction": 0.90 }
+                    ]
+                },
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        { "bucketId": "five_hour", "remainingFraction": 1.0 },
+                        { "bucketId": "weekly", "remainingFraction": 0.99 }
+                    ]
+                }
+            ]
+        });
+        let models = serde_json::json!({
+            "userStatus": {
+                "email": "pilot@example.com",
+                "planStatus": { "planInfo": { "planName": "Google AI Ultra" } },
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "label": "Gemini 4 Neon",
+                            "quotaInfo": { "remainingFraction": 1.0 }
+                        },
+                        {
+                            "label": "Claude Opus 4.6",
+                            "quotaInfo": { "remainingFraction": 1.0 }
+                        },
+                        {
+                            "label": "Gemini 4 Argon",
+                            "modelOrAlias": { "model": "gemini-4-argon" },
+                            "quotaInfo": { "remainingFraction": 0.52, "resetTime": h3 }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let quota = merge_antigravity_quotas(&sample_record(), Some(&summary), Some(&models))
+            .expect("should merge");
+        assert_eq!(quota.email, "pilot@example.com");
+        assert_eq!(quota.plan_label, "AI Ultra");
+        assert_eq!(quota.primary_pct, 64);
+        let names: Vec<(&str, u8)> = quota
+            .sub_pools
+            .iter()
+            .map(|p| (p.name.as_str(), p.pct))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("Gemini 模型池 (5h)", 64),
+                ("Gemini 模型池 (周)", 90),
+                ("Argon 模型池 (5h)", 52),
+                ("Claude / GPT 池 (5h)", 100),
+                ("Claude / GPT 池 (周)", 99),
+            ]
         );
     }
 }

@@ -415,17 +415,39 @@ fn resolve_agy_target_id_and_alias(
         .map(|r| r.id.clone())
         .unwrap_or_else(|| agy_account_id_for_email(clean));
 
+    let strip_agy_platform_prefix = |raw: &str| -> String {
+        let mut s = raw.trim();
+        loop {
+            if let Some(rest) = s.strip_prefix("反重力 · ") {
+                s = rest.trim();
+            } else if let Some(rest) = s.strip_prefix("反重力·") {
+                s = rest.trim();
+            } else {
+                break;
+            }
+        }
+        if s.is_empty() {
+            "本机".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+
     let alias = alias_override
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| matched_existing.map(|r| r.alias.clone()))
+        .map(strip_agy_platform_prefix)
+        .or_else(|| matched_existing.map(|r| strip_agy_platform_prefix(&r.alias)))
         .unwrap_or_else(|| {
             if has_real_email {
-                let prefix = clean.split('@').next().unwrap_or("反重力");
-                format!("反重力 · {prefix}")
+                let prefix = clean.split('@').next().unwrap_or("本机").trim();
+                if prefix.is_empty() {
+                    "本机".to_string()
+                } else {
+                    prefix.to_string()
+                }
             } else {
-                "本机反重力".to_string()
+                "本机".to_string()
             }
         });
 
@@ -492,16 +514,62 @@ async fn detect_antigravity_local_inner(
         };
         let direct = AntigravityProvider::new();
         if let Ok(mut quota) = direct.fetch_from_local_server(&probe_rec).await {
-            let matching_cand = offline_candidates.iter().find(|c| {
-                c.email != "local@antigravity"
+            let mut matching_cand = offline_candidates
+                .iter()
+                .find(|c| {
+                    c.email != "local@antigravity"
+                        && quota.email != "local@antigravity"
+                        && c.email.eq_ignore_ascii_case(&quota.email)
+                })
+                .map(|c| c.creds.clone());
+
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(4))
+                .build()
+                .ok();
+            let mut resolved_candidates = Vec::with_capacity(offline_candidates.len());
+
+            for c in &offline_candidates {
+                let mut eff_email = c.email.clone();
+                if eff_email.is_empty() || eff_email == "local@antigravity" {
+                    if let (Some(client), Some(tok)) = (&http, c.creds.access_token.as_deref()) {
+                        if let Some(real_email) =
+                            crate::providers::antigravity::fetch_google_userinfo_email(client, tok)
+                                .await
+                        {
+                            eff_email = real_email;
+                        }
+                    }
+                }
+                if matching_cand.is_none()
                     && quota.email != "local@antigravity"
-                    && c.email.eq_ignore_ascii_case(&quota.email)
-            });
-            if (quota.email.is_empty() || quota.email == "local@antigravity")
-                && offline_candidates.len() == 1
-            {
-                quota.email = offline_candidates[0].email.clone();
+                    && eff_email != "local@antigravity"
+                    && eff_email.eq_ignore_ascii_case(&quota.email)
+                {
+                    matching_cand = Some(c.creds.clone());
+                }
+                resolved_candidates.push((eff_email, c));
             }
+
+            if (quota.email.is_empty() || quota.email == "local@antigravity")
+                && !resolved_candidates.is_empty()
+            {
+                if let Some((eff_email, c)) = resolved_candidates
+                    .iter()
+                    .find(|(e, _)| !e.is_empty() && e != "local@antigravity")
+                {
+                    quota.email = eff_email.clone();
+                    if matching_cand.is_none() {
+                        matching_cand = Some(c.creds.clone());
+                    }
+                } else if resolved_candidates.len() == 1 {
+                    quota.email = resolved_candidates[0].0.clone();
+                    if matching_cand.is_none() {
+                        matching_cand = Some(resolved_candidates[0].1.creds.clone());
+                    }
+                }
+            }
+
             let (target_id, target_alias) =
                 resolve_agy_target_id_and_alias(store, &quota.email, alias_override.as_deref());
             quota.id = target_id.clone();
@@ -520,12 +588,90 @@ async fn detect_antigravity_local_inner(
             };
             let _ = store.add_account(
                 &req,
-                matching_cand.map(|c| &c.creds),
+                matching_cand.as_ref(),
                 Some(target_id),
                 None,
                 Some(quota.clone()),
             )?;
             let _ = store.update_cached_quota(&quota);
+
+            // 若离线缓存/凭据管理器中还存有其他独立反重力账号的可用 OAuth 凭据，同步补全或刷新，避免多号切换时丢掉旧号 Token
+            if alias_override.is_none() {
+                let existing_agy = store
+                    .list_records()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| r.platform == PlatformId::Antigravity)
+                    .collect::<Vec<_>>();
+                for (eff_email, cand) in resolved_candidates {
+                    if eff_email.is_empty()
+                        || eff_email == "local@antigravity"
+                        || eff_email.eq_ignore_ascii_case(&quota.email)
+                    {
+                        continue;
+                    }
+                    let already_saved = existing_agy
+                        .iter()
+                        .any(|r| r.email.eq_ignore_ascii_case(&eff_email));
+                    if !already_saved && !persist_expired {
+                        continue;
+                    }
+                    let extra_probe = StoredAccountRecord {
+                        id: "agy-extra-probe".to_string(),
+                        platform: PlatformId::Antigravity,
+                        alias: cand.alias.clone(),
+                        email: eff_email.clone(),
+                        tier: cand.tier,
+                        plan_label: cand.plan_label.clone(),
+                        auth_method: AuthMethod::OauthToken,
+                        profile_dir: None,
+                        is_demo: false,
+                        encrypted_secret: None,
+                        cached_quota: None,
+                    };
+                    let mut extra_q = agy_provider
+                        .fetch_quota(&extra_probe, Some(&cand.creds), &ctx)
+                        .await;
+                    if extra_q.status == AccountStatus::Ok {
+                        let extra_email = if extra_q.email.is_empty()
+                            || extra_q.email == "local@antigravity"
+                        {
+                            eff_email.clone()
+                        } else {
+                            extra_q.email.clone()
+                        };
+                        extra_q.email = extra_email.clone();
+                        let (eid, ealias) =
+                            resolve_agy_target_id_and_alias(store, &extra_email, None);
+                        extra_q.id = eid.clone();
+                        extra_q.alias = ealias.clone();
+                        let ereq = AddAccountRequest {
+                            platform: PlatformId::Antigravity,
+                            alias: ealias,
+                            email: extra_email,
+                            tier: extra_q.tier,
+                            plan_label: extra_q.plan_label.clone(),
+                            auth_method: AuthMethod::OauthToken,
+                            secret_input: None,
+                            refresh_token: None,
+                            profile_id: None,
+                        };
+                        if store
+                            .add_account(
+                                &ereq,
+                                Some(&cand.creds),
+                                Some(eid),
+                                None,
+                                Some(extra_q.clone()),
+                            )
+                            .is_ok()
+                        {
+                            let _ = store.update_cached_quota(&extra_q);
+                        }
+                    }
+                }
+            }
+
             emit_snapshot(app, store);
             return Ok(DetectLocalResult {
                 found: true,
