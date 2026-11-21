@@ -1,0 +1,323 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --surface-panel: rgba(11, 14, 23, 0.78);
+  --surface-card: rgba(255, 255, 255, 0.045);
+  --surface-card-hover: rgba(255, 255, 255, 0.085);
+  --surface-elevated: rgba(17, 22, 36, 0.94);
+  --border-subtle: rgba(255, 255, 255, 0.09);
+  --border-hover: rgba(255, 255, 255, 0.2);
+  --highlight-top: rgba(255, 255, 255, 0.14);
+  --divider: rgba(255, 255, 255, 0.08);
+  --track-bg: rgba(255, 255, 255, 0.08);
+  --pill-bg: rgba(255, 255, 255, 0.05);
+  --pill-active-bg: rgba(56, 189, 248, 0.18);
+  --pill-active-border: rgba(56, 189, 248, 0.45);
+  --text-main: #f1f5f9;
+  --text-sub: #94a3b8;
+  --text-muted: #64748b;
+  --pct-high: #38bdf8;
+  --pct-mid: #fbbf24;
+  --pct-low: #fb7185;
+  --input-bg: rgba(255, 255, 255, 0.06);
+  --input-border: rgba(255, 255, 255, 0.14);
+  --select-bg: #131826;
+  --select-text: #f1f5f9;
+  --badge-paid-bg: rgba(99, 102, 241, 0.18);
+  --badge-paid-text: #a5b4fc;
+  --badge-paid-border: rgba(129, 140, 248, 0.35);
+  --scrollbar-thumb: rgba(148, 163, 184, 0.42);
+  --scrollbar-track: transparent;
+}
+
+html.theme-light {
+  color-scheme: light;
+  --surface-panel: rgba(248, 250, 252, 0.78);
+  --surface-card: rgba(255, 255, 255, 0.72);
+  --surface-card-hover: rgba(255, 255, 255, 0.94);
+  --surface-elevated: rgba(255, 255, 255, 0.95);
+  --border-subtle: rgba(15, 23, 42, 0.09);
+  --border-hover: rgba(15, 23, 42, 0.18);
+  --highlight-top: rgba(255, 255, 255, 0.92);
+  --divider: rgba(15, 23, 42, 0.08);
+  --track-bg: rgba(15, 23, 42, 0.09);
+  --pill-bg: rgba(15, 23, 42, 0.045);
+  --pill-active-bg: rgba(2, 132, 199, 0.12);
+  --pill-active-border: rgba(2, 132, 199, 0.38);
+  --text-main: #0f172a;
+  --text-sub: #475569;
+  --text-muted: #64748b;
+  --pct-high: #0284c7;
+  --pct-mid: #d97706;
+  --pct-low: #e11d48;
+  --input-bg: rgba(15, 23, 42, 0.04);
+  --input-border: rgba(15, 23, 42, 0.14);
+  --select-bg: #ffffff;
+  --select-text: #0f172a;
+  --badge-paid-bg: rgba(79, 70, 229, 0.1);
+  --badge-paid-text: #4338ca;
+  --badge-paid-border: rgba(79, 70, 229, 0.25);
+  --scrollbar-thumb: rgba(71, 85, 105, 0.42);
+  --scrollbar-track: transparent;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-font-smoothing: antialiased;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  color: var(--text-main);
+  user-select: none;
+  background: transparent;
+}
+
+body.browser-preview {
+  background:
+    radial-gradient(circle at 18% 22%, rgba(56, 189, 248, 0.28), transparent 44%),
+    radial-gradient(circle at 82% 18%, rgba(139, 92, 246, 0.28), transparent 46%),
+    radial-gradient(circle at 60% 82%, rgba(236, 72, 153, 0.18), transparent 45%),
+    linear-gradient(135deg, #070b14 0%, #0f172a 52%, #111827 100%);
+}
+
+html.theme-light body.browser-preview {
+  background:
+    radial-gradient(circle at 20% 25%, rgba(147, 197, 253, 0.65), transparent 50%),
+    radial-gradient(circle at 82% 20%, rgba(196, 181, 253, 0.62), transparent 50%),
+    linear-gradient(135deg, #e2e8f0 0%, #f1f5f9 55%, #dbeafe 100%);
+}
+
+:where(button, input, select, textarea, a):focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Primary Panel Shell */
+.glass-surface {
+  background: var(--surface-panel);
+  backdrop-filter: blur(28px) saturate(165%);
+  -webkit-backdrop-filter: blur(28px) saturate(165%);
+  border: 1px solid var(--border-subtle);
+  box-shadow: inset 0 1px 0 0 var(--highlight-top);
+}
+
+.glass-surface-elevated {
+  background: var(--surface-elevated);
+  backdrop-filter: blur(28px) saturate(165%);
+  -webkit-backdrop-filter: blur(28px) saturate(165%);
+  border: 1px solid var(--border-subtle);
+  box-shadow:
+    0 20px 44px -12px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 0 var(--highlight-top);
+}
+
+html.theme-light .glass-surface-elevated {
+  box-shadow:
+    0 20px 40px -12px rgba(15, 23, 42, 0.16),
+    inset 0 1px 0 0 var(--highlight-top);
+}
+
+.glass-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border-subtle);
+  transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+              background-color 0.2s ease,
+              border-color 0.2s ease,
+              box-shadow 0.2s ease;
+}
+
+.glass-card:hover {
+  background: var(--surface-card-hover);
+  border-color: var(--border-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px -10px rgba(0, 0, 0, 0.35);
+}
+
+html.theme-light .glass-card:hover {
+  box-shadow: 0 8px 20px -10px rgba(15, 23, 42, 0.12);
+}
+
+.glass-icon-btn {
+  background: var(--pill-bg);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-sub);
+  transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease, transform 0.15s ease;
+}
+
+.glass-icon-btn:hover {
+  background: var(--surface-card-hover);
+  border-color: var(--border-hover);
+  color: var(--text-main);
+}
+
+.glass-icon-btn:active {
+  transform: scale(0.95);
+}
+
+.aura-input {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: var(--text-main);
+}
+
+.aura-input::placeholder {
+  color: var(--text-muted);
+}
+
+.aura-select {
+  background: var(--select-bg);
+  border: 1px solid var(--input-border);
+  color: var(--select-text);
+}
+
+/* Floating Orb */
+.orb-btn {
+  width: 64px;
+  height: 64px;
+  border-radius: 9999px;
+  position: relative;
+  cursor: grab;
+  transition: transform 0.28s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.3s ease;
+}
+
+.orb-btn:active {
+  cursor: grabbing;
+  transform: scale(0.94);
+}
+
+.orb-btn:hover {
+  transform: scale(1.06);
+  box-shadow:
+    0 0 22px rgba(56, 189, 248, 0.42),
+    0 12px 24px rgba(0, 0, 0, 0.38),
+    inset 0 1px 1px rgba(255, 255, 255, 0.55);
+}
+
+@keyframes orbPulse {
+  0%, 100% {
+    opacity: 0.45;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.82;
+    transform: scale(1.08);
+  }
+}
+
+.orb-halo {
+  animation: orbPulse 3.6s ease-in-out infinite;
+}
+
+.edge-dock {
+  transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.edge-dock:hover {
+  transform: translateX(-2px);
+}
+
+.bar-fill {
+  transition: width 0.55s cubic-bezier(0.22, 1, 0.36, 1), background-color 0.35s ease;
+}
+
+@keyframes spinOnce {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spinning {
+  animation: spinOnce 0.7s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* Hide horizontal scrollbar on platform pill strip while retaining scrollability */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Modern scrollbar standard + conditional WebKit fallback */
+.custom-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+@supports not (scrollbar-color: auto) {
+  .custom-scroll {
+    scrollbar-width: auto;
+  }
+  .custom-scroll::-webkit-scrollbar {
+    width: 6px;
+  }
+  .custom-scroll::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+  .custom-scroll::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 9999px;
+  }
+}
+
+/* Native <dialog> modal scrolling & backdrop rules */
+dialog.aura-dialog {
+  margin: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-main);
+  max-width: calc(100vw - 1.25rem);
+  max-height: calc(100vh - 1.25rem);
+  overflow: visible;
+}
+
+dialog.aura-dialog[open] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+dialog.aura-dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog.aura-dialog::backdrop {
+  background-color: rgba(4, 7, 15, 0.56);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orb-halo,
+  .spinning {
+    animation: none !important;
+  }
+  .bar-fill,
+  .glass-card,
+  .glass-icon-btn,
+  .orb-btn,
+  .edge-dock {
+    transition: none !important;
+  }
+}

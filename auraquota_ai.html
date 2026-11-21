@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AuraQuota · 极简玻璃质感 AI 额度悬浮窗原型</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+  <style>
+    :root {
+      --glass-bg: rgba(18, 22, 34, 0.56);
+      --glass-card: rgba(255, 255, 255, 0.06);
+      --glass-card-hover: rgba(255, 255, 255, 0.11);
+      --glass-border: rgba(255, 255, 255, 0.15);
+      --glass-highlight: rgba(255, 255, 255, 0.28);
+      --text-main: #f8fafc;
+      --text-sub: #94a3b8;
+    }
+
+    body.theme-light {
+      --glass-bg: rgba(255, 255, 255, 0.62);
+      --glass-card: rgba(255, 255, 255, 0.52);
+      --glass-card-hover: rgba(255, 255, 255, 0.78);
+      --glass-border: rgba(255, 255, 255, 0.72);
+      --glass-highlight: rgba(255, 255, 255, 0.95);
+      --text-main: #0f172a;
+      --text-sub: #475569;
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+      color: var(--text-main);
+      overflow-x: hidden;
+      user-select: none;
+      transition: background 0.6s ease, color 0.3s ease;
+    }
+
+    /* Simulated Windows 11 Wallpapers */
+    .wallpaper-nebula {
+      background:
+        radial-gradient(circle at 18% 22%, rgba(56, 189, 248, 0.32), transparent 44%),
+        radial-gradient(circle at 82% 18%, rgba(139, 92, 246, 0.34), transparent 46%),
+        radial-gradient(circle at 60% 82%, rgba(236, 72, 153, 0.22), transparent 45%),
+        linear-gradient(135deg, #070b14 0%, #0f172a 52%, #111827 100%);
+    }
+
+    .wallpaper-aurora {
+      background:
+        radial-gradient(circle at 25% 75%, rgba(16, 185, 129, 0.28), transparent 48%),
+        radial-gradient(circle at 78% 28%, rgba(59, 130, 246, 0.35), transparent 48%),
+        radial-gradient(circle at 50% 45%, rgba(99, 102, 241, 0.22), transparent 55%),
+        linear-gradient(145deg, #06131a 0%, #0c192c 55%, #090d16 100%);
+    }
+
+    .wallpaper-frost {
+      background:
+        radial-gradient(circle at 20% 25%, rgba(147, 197, 253, 0.65), transparent 50%),
+        radial-gradient(circle at 82% 20%, rgba(196, 181, 253, 0.62), transparent 50%),
+        radial-gradient(circle at 65% 85%, rgba(167, 243, 208, 0.5), transparent 50%),
+        linear-gradient(135deg, #e2e8f0 0%, #f1f5f9 55%, #dbeafe 100%);
+    }
+
+    /* Glassmorphism Core */
+    .glass-surface {
+      background: var(--glass-bg);
+      backdrop-filter: blur(28px) saturate(165%);
+      -webkit-backdrop-filter: blur(28px) saturate(165%);
+      border: 1px solid var(--glass-border);
+      box-shadow:
+        0 24px 60px -12px rgba(0, 0, 0, 0.48),
+        inset 0 1px 0 0 var(--glass-highlight);
+    }
+
+    body.theme-light .glass-surface {
+      box-shadow:
+        0 24px 50px -12px rgba(15, 23, 42, 0.16),
+        inset 0 1px 0 0 var(--glass-highlight);
+    }
+
+    .glass-card {
+      background: var(--glass-card);
+      border: 1px solid var(--glass-border);
+      transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+                  background 0.22s ease,
+                  border-color 0.22s ease,
+                  box-shadow 0.22s ease;
+    }
+
+    .glass-card:hover {
+      background: var(--glass-card-hover);
+      transform: translateY(-1px);
+      box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.25);
+    }
+
+    /* Floating Orb */
+    .orb-btn {
+      width: 64px;
+      height: 64px;
+      border-radius: 9999px;
+      position: relative;
+      cursor: grab;
+      transition: transform 0.28s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.3s ease;
+    }
+
+    .orb-btn:active {
+      cursor: grabbing;
+      transform: scale(0.94);
+    }
+
+    .orb-btn:hover {
+      transform: scale(1.08);
+      box-shadow:
+        0 0 28px rgba(56, 189, 248, 0.42),
+        0 16px 36px rgba(0, 0, 0, 0.42),
+        inset 0 1px 1px rgba(255, 255, 255, 0.55);
+    }
+
+    @keyframes orbPulse {
+      0%, 100% { opacity: 0.45; transform: scale(1); }
+      50% { opacity: 0.85; transform: scale(1.12); }
+    }
+
+    .orb-halo {
+      animation: orbPulse 3.6s ease-in-out infinite;
+    }
+
+    /* Panel Morph Animation */
+    .panel-shell {
+      transform-origin: top right;
+      transition: opacity 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+                  transform 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .panel-hidden {
+      opacity: 0;
+      transform: scale(0.86) translateY(-10px);
+      pointer-events: none;
+    }
+
+    /* Edge Dock Handle */
+    .edge-dock {
+      transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1), width 0.25s ease;
+    }
+    .edge-dock:hover {
+      transform: translateX(-4px);
+    }
+
+    /* Progress Bar Shimmer */
+    .bar-fill {
+      transition: width 0.55s cubic-bezier(0.22, 1, 0.36, 1), background-color 0.35s ease;
+    }
+
+    @keyframes spinOnce {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .spinning {
+      animation: spinOnce 0.7s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    }
+
+    /* Subtle scrollbar */
+    .custom-scroll::-webkit-scrollbar {
+      width: 5px;
+    }
+    .custom-scroll::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .custom-scroll::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.35);
+      border-radius: 9999px;
+    }
+
+    /* Toast */
+    .toast-box {
+      transition: opacity 0.25s ease, transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+  </style>
+</head>
+<body class="wallpaper-nebula">
+
+  <!-- Left Background Guide (Simulates Desktop Context + Interactive Playground Controls) -->
+  <div class="fixed inset-0 pointer-events-none overflow-hidden">
+    <div class="absolute -top-24 -left-24 w-96 h-96 rounded-full bg-sky-500/10 blur-3xl"></div>
+    <div class="absolute bottom-10 left-1/3 w-80 h-80 rounded-full bg-violet-500/10 blur-3xl"></div>
+  </div>
+
+  <main class="relative min-h-screen w-full p-5 sm:p-8 flex flex-col justify-between">
+    <!-- Top-Left Playground Control Bar (For Testing Prototype Aesthetics) -->
+    <section class="max-w-lg space-y-4 z-10">
+      <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full glass-surface text-xs font-medium tracking-wide">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span>Tauri 2 桌面端交互原型 · 示例数据预览</span>
+      </div>
+
+      <div class="space-y-2">
+        <h1 class="text-2xl sm:text-3xl font-semibold tracking-tight">AuraQuota 玻璃悬浮面板</h1>
+        <p class="text-sm leading-relaxed" style="color: var(--text-sub);">
+          右上角即最终桌面端形态。你可以点击切换<strong>悬浮圆球 / 右上角展开面板 / 贴边收起</strong>，也可以拖动圆球、切换多账号、添加新账号或模拟额度消耗。
+        </p>
+      </div>
+
+      <!-- Prototype Playground Controls -->
+      <div class="glass-surface rounded-2xl p-4 space-y-3">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-xs font-medium mr-1" style="color: var(--text-sub);">形态切换：</span>
+          <button id="demoModePanel" class="px-3 py-1.5 rounded-xl text-xs font-medium bg-sky-500/25 border border-sky-400/40 hover:bg-sky-500/35 transition">
+            右上角展开
+          </button>
+          <button id="demoModeOrb" class="px-3 py-1.5 rounded-xl text-xs font-medium glass-card">
+            悬浮圆球（可拖拽）
+          </button>
+          <button id="demoModeEdge" class="px-3 py-1.5 rounded-xl text-xs font-medium glass-card">
+            右上角贴边收起
+          </button>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-xs font-medium mr-1" style="color: var(--text-sub);">桌面壁纸：</span>
+          <button id="bgNebula" class="px-2.5 py-1 rounded-lg text-xs glass-card border-sky-400/50">深空星云</button>
+          <button id="bgAurora" class="px-2.5 py-1 rounded-lg text-xs glass-card">极光深蓝</button>
+          <button id="bgFrost" class="px-2.5 py-1 rounded-lg text-xs glass-card">浅色磨砂</button>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2 pt-1 border-t border-white/10">
+          <button id="demoSimulateDrain" class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium glass-card hover:border-amber-400/50">
+            <i data-lucide="zap" class="w-3.5 h-3.5 text-amber-400"></i>
+            模拟消耗额度
+          </button>
+          <button id="demoResetData" class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium glass-card">
+            <i data-lucide="rotate-ccw" class="w-3.5 h-3.5 text-sky-400"></i>
+            重置示例数据
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Bottom Simulated Windows 11 Taskbar Hint -->
+    <div class="hidden sm:flex items-center gap-2 text-xs z-10" style="color: var(--text-sub);">
+      <i data-lucide="sparkles" class="w-3.5 h-3.5 text-sky-400"></i>
+      <span>提示：点击面板内任意账号卡片可展开子模型额度详情；悬浮球支持按住自由拖动。</span>
+    </div>
+  </main>
+
+  <!-- ==================== 1. FLOATING ORB WIDGET ==================== -->
+  <div id="orbContainer" class="fixed top-6 right-6 z-40 hidden">
+    <div class="relative group">
+      <!-- Glow Halo -->
+      <div id="orbHalo" class="orb-halo absolute -inset-1.5 rounded-full bg-gradient-to-tr from-sky-400/40 via-indigo-400/40 to-fuchsia-400/40 blur-md pointer-events-none"></div>
+
+      <!-- Hover Mini Tooltip -->
+      <div id="orbTooltip" class="absolute right-20 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap glass-surface px-3 py-2 rounded-xl text-xs">
+        <div class="font-medium">综合可用额度 <span id="orbTooltipPct" class="text-sky-400 font-semibold">76%</span></div>
+        <div id="orbTooltipSub" class="text-[11px] mt-0.5" style="color: var(--text-sub);">最低项：Claude 主号 22% · 点击展开</div>
+      </div>
+
+      <!-- Draggable Glass Orb -->
+      <button id="orbButton" type="button" aria-label="展开额度面板" class="orb-btn glass-surface flex items-center justify-center">
+        <svg class="w-14 h-14 -rotate-90" viewBox="0 0 60 60">
+          <circle cx="30" cy="30" r="24" fill="none" stroke="rgba(148,163,184,0.22)" stroke-width="4" />
+          <circle id="orbRing" cx="30" cy="30" r="24" fill="none" stroke="url(#orbGrad)" stroke-width="4"
+                  stroke-linecap="round" stroke-dasharray="150.8" stroke-dashoffset="36"
+                  style="transition: stroke-dashoffset 0.6s cubic-bezier(0.22,1,0.36,1);" />
+          <defs>
+            <linearGradient id="orbGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stop-color="#38bdf8" />
+              <stop offset="55%" stop-color="#818cf8" />
+              <stop offset="100%" stop-color="#c084fc" />
+            </linearGradient>
+          </defs>
+        </svg>
+        <div class="absolute inset-0 flex flex-col items-center justify-center">
+          <span id="orbCenterPct" class="text-sm font-bold leading-none">76%</span>
+          <span class="text-[9px] mt-0.5 opacity-75">AI额度</span>
+        </div>
+      </button>
+    </div>
+  </div>
+
+  <!-- ==================== 2. TOP-RIGHT EDGE DOCK TAB ==================== -->
+  <button id="edgeDockBtn" type="button" class="edge-dock fixed top-24 right-0 z-40 hidden glass-surface rounded-l-2xl py-4 px-2.5 flex flex-col items-center gap-2 border-r-0 cursor-pointer">
+    <span id="edgeStatusDot" class="w-2 h-2 rounded-full bg-sky-400"></span>
+    <span class="text-xs font-semibold [writing-mode:vertical-rl] tracking-widest">AI 额度</span>
+    <span id="edgePct" class="text-[11px] font-bold text-sky-400">76%</span>
+  </button>
+
+  <!-- ==================== 3. TOP-RIGHT EXPANDED GLASS PANEL ==================== -->
+  <aside id="quotaPanel" class="panel-shell fixed top-4 right-4 sm:top-5 sm:right-5 z-30 w-[calc(100vw-2rem)] sm:w-[390px] max-h-[calc(100vh-2.5rem)] glass-surface rounded-3xl flex flex-col overflow-hidden">
+    <!-- Panel Header -->
+    <header class="px-4 pt-4 pb-3 flex items-center justify-between border-b border-white/10">
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-sky-400 via-indigo-500 to-purple-500 flex items-center justify-center shadow-lg shadow-indigo-500/25">
+          <i data-lucide="sparkles" class="w-4 h-4 text-white"></i>
+        </div>
+        <div>
+          <div class="flex items-center gap-1.5">
+            <h2 class="text-sm font-semibold tracking-tight">AuraQuota</h2>
+            <span id="accountCountBadge" class="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10 font-medium">6 账号</span>
+          </div>
+          <p id="lastUpdatedText" class="text-[11px]" style="color: var(--text-sub);">刚刚同步 · 6 个平台</p>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-1">
+        <button id="btnRefresh" type="button" title="刷新全部额度" class="w-8 h-8 rounded-xl glass-card flex items-center justify-center">
+          <i id="refreshIcon" data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
+        </button>
+        <button id="btnAddAccount" type="button" title="添加账号" class="w-8 h-8 rounded-xl glass-card flex items-center justify-center">
+          <i data-lucide="plus" class="w-4 h-4"></i>
+        </button>
+        <button id="btnToEdge" type="button" title="贴边收起" class="w-8 h-8 rounded-xl glass-card flex items-center justify-center">
+          <i data-lucide="panel-right-close" class="w-3.5 h-3.5"></i>
+        </button>
+        <button id="btnToOrb" type="button" title="缩成悬浮圆球" class="w-8 h-8 rounded-xl glass-card flex items-center justify-center">
+          <i data-lucide="minimize-2" class="w-3.5 h-3.5"></i>
+        </button>
+      </div>
+    </header>
+
+    <!-- Summary Strip + Filters -->
+    <div class="px-4 pt-3 pb-2 space-y-2.5">
+      <!-- Platform Filter Pills -->
+      <div id="platformTabs" class="flex flex-wrap items-center gap-1.5">
+        <!-- Rendered by JS -->
+      </div>
+
+      <!-- Tier Filter + Sort Row -->
+      <div class="flex items-center justify-between text-[11px]">
+        <div class="flex items-center gap-1.5">
+          <button data-tier="all" class="tier-btn px-2.5 py-1 rounded-lg font-medium bg-white/15">全部方案</button>
+          <button data-tier="paid" class="tier-btn px-2.5 py-1 rounded-lg font-medium opacity-70 hover:opacity-100">仅付费</button>
+          <button data-tier="free" class="tier-btn px-2.5 py-1 rounded-lg font-medium opacity-70 hover:opacity-100">仅免费</button>
+        </div>
+        <button id="btnTogglePrivacy" type="button" class="inline-flex items-center gap-1 opacity-75 hover:opacity-100 transition">
+          <i id="privacyIcon" data-lucide="eye" class="w-3.5 h-3.5"></i>
+          <span id="privacyLabel">隐私模式</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Scrollable Account Quota Cards -->
+    <div id="cardsContainer" class="flex-1 overflow-y-auto custom-scroll px-4 py-2 space-y-2.5">
+      <!-- Rendered by JS -->
+    </div>
+
+    <!-- Footer Status Bar -->
+    <footer class="px-4 py-2.5 border-t border-white/10 flex items-center justify-between text-[11px]" style="color: var(--text-sub);">
+      <div class="flex items-center gap-1.5">
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+        <span>自动轮询：每 5 分钟</span>
+      </div>
+      <span id="footerLowAlert" class="font-medium text-amber-400">1 个账号额度偏低</span>
+    </footer>
+  </aside>
+
+  <!-- ==================== 4. ADD ACCOUNT MODAL ==================== -->
+  <div id="addModal" class="fixed inset-0 z-50 hidden items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div class="glass-surface w-full max-w-sm rounded-3xl p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="text-base font-semibold">添加监控账号</h3>
+        <button id="closeModalBtn" type="button" class="w-7 h-7 rounded-lg glass-card flex items-center justify-center">
+          <i data-lucide="x" class="w-4 h-4"></i>
+        </button>
+      </div>
+
+      <form id="addAccountForm" class="space-y-3 text-xs">
+        <div>
+          <label class="block mb-1.5 font-medium" style="color: var(--text-sub);">选择平台</label>
+          <div class="grid grid-cols-2 gap-2" id="modalPlatformGrid">
+            <button type="button" data-plat="antigravity" class="plat-pick px-3 py-2 rounded-xl glass-card text-left font-medium border-sky-400/60 bg-sky-500/20">反重力 (AGY)</button>
+            <button type="button" data-plat="gemini" class="plat-pick px-3 py-2 rounded-xl glass-card text-left font-medium">Gemini App</button>
+            <button type="button" data-plat="codex" class="plat-pick px-3 py-2 rounded-xl glass-card text-left font-medium">Codex</button>
+            <button type="button" data-plat="claude" class="plat-pick px-3 py-2 rounded-xl glass-card text-left font-medium">Claude</button>
+            <button type="button" data-plat="commandcode" class="plat-pick px-3 py-2 rounded-xl glass-card text-left font-medium">Command Code</button>
+            <button type="button" data-plat="opencode" class="plat-pick px-3 py-2 rounded-xl glass-card text-left font-medium">OpenCode Go</button>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2.5">
+          <div>
+            <label for="inputAlias" class="block mb-1 font-medium" style="color: var(--text-sub);">账号备注</label>
+            <input id="inputAlias" type="text" required placeholder="如：备用号 / 公司号"
+                   class="w-full px-3 py-2 rounded-xl bg-white/10 border border-white/15 focus:outline-none focus:border-sky-400 text-xs" />
+          </div>
+          <div>
+            <label for="inputPlan" class="block mb-1 font-medium" style="color: var(--text-sub);">订阅类型</label>
+            <select id="inputPlan" class="w-full px-3 py-2 rounded-xl bg-slate-900/90 text-white border border-white/15 focus:outline-none focus:border-sky-400 text-xs">
+              <option value="paid|Pro">付费 · Pro / Plus</option>
+              <option value="paid|GOAT">付费 · GOAT / Go</option>
+              <option value="paid|Ultra">付费 · Ultra / Max</option>
+              <option value="free|Free">免费 · Free</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label for="inputEmail" class="block mb-1 font-medium" style="color: var(--text-sub);">登录邮箱（仅本地显示）</label>
+          <input id="inputEmail" type="email" required placeholder="name@example.com"
+                 class="w-full px-3 py-2 rounded-xl bg-white/10 border border-white/15 focus:outline-none focus:border-sky-400 text-xs" />
+        </div>
+
+        <div class="p-2.5 rounded-xl bg-sky-500/10 border border-sky-400/20 text-[11px] leading-relaxed" style="color: var(--text-sub);">
+          <strong class="text-sky-400">桌面端真实接入方式：</strong>
+          <span id="authHintText">读取 Windows 凭据管理器与本地 language_server.exe</span>
+        </div>
+
+        <div class="flex justify-end gap-2 pt-1">
+          <button type="button" id="cancelModalBtn" class="px-4 py-2 rounded-xl glass-card font-medium">取消</button>
+          <button type="submit" class="px-4 py-2 rounded-xl bg-gradient-to-r from-sky-500 to-indigo-500 text-white font-medium shadow-lg shadow-sky-500/25 hover:brightness-110 transition">
+            模拟登录并添加
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast-box fixed bottom-6 left-1/2 -translate-x-1/2 z-50 opacity-0 translate-y-3 pointer-events-none glass-surface px-4 py-2 rounded-full text-xs font-medium">
+    已同步最新额度
+  </div>
+
+  <script>
+    const PLATFORMS = {
+      all: { name: "全部", color: "#38bdf8" },
+      antigravity: { name: "反重力", color: "#60a5fa", hint: "读取本地 language_server.exe 与 Windows 凭据管理器" },
+      gemini: { name: "Gemini", color: "#a78bfa", hint: "通过独立 WebView2 配置文件登录 Google 账号读取额度" },
+      codex: { name: "Codex", color: "#34d399", hint: "读取本地 Codex CLI OAuth 会话与 5h/周限额接口" },
+      claude: { name: "Claude", color: "#fb923c", hint: "通过内置登录窗口或 sessionKey Cookie 读取 5h/周额度" },
+      commandcode: { name: "Command Code", color: "#f472b6", hint: "通过浏览器 Cookie / 多会话登录读取 GOAT/Go 的 5h、周、月度与充值余额" },
+      opencode: { name: "OpenCode Go", color: "#2dd4bf", hint: "通过浏览器 Cookie / Console 会话读取 5h(20%)、周(50%)、月度额度与余额" }
+    };
+
+    const INITIAL_ACCOUNTS = [
+      {
+        id: "agy-1",
+        platform: "antigravity",
+        alias: "开发主号",
+        email: "dev.main@gmail.com",
+        tier: "paid",
+        planLabel: "AI Pro",
+        primaryPct: 84,
+        resetIn: "3小时18分后重置",
+        subPools: [
+          { name: "Gemini 4 / Flash (5h)", pct: 84 },
+          { name: "Claude / GPT 池 (周)", pct: 62 }
+        ]
+      },
+      {
+        id: "agy-2",
+        platform: "antigravity",
+        alias: "免费备用号",
+        email: "backup.agy@gmail.com",
+        tier: "free",
+        planLabel: "Free",
+        primaryPct: 45,
+        resetIn: "4小时05分后重置",
+        subPools: [
+          { name: "Gemini Flash (5h)", pct: 45 },
+          { name: "周总额度", pct: 70 }
+        ]
+      },
+      {
+        id: "gem-1",
+        platform: "gemini",
+        alias: "日常主号",
+        email: "dev.main@gmail.com",
+        tier: "paid",
+        planLabel: "AI Pro",
+        primaryPct: 91,
+        resetIn: "今日 24:00 刷新",
+        subPools: [
+          { name: "高阶模型对话额度", pct: 91 },
+          { name: "Task / 深度研究", pct: 78 }
+        ]
+      },
+      {
+        id: "codex-1",
+        platform: "codex",
+        alias: "主力工作号",
+        email: "work.codex@outlook.com",
+        tier: "paid",
+        planLabel: "Plus",
+        primaryPct: 68,
+        resetIn: "2小时42分后重置",
+        subPools: [
+          { name: "5小时滑动窗口", pct: 68 },
+          { name: "7天周额度", pct: 81 }
+        ]
+      },
+      {
+        id: "claude-1",
+        platform: "claude",
+        alias: "主力号",
+        email: "studio@proton.me",
+        tier: "paid",
+        planLabel: "Pro",
+        primaryPct: 22,
+        resetIn: "1小时12分后重置",
+        subPools: [
+          { name: "5小时会话限额", pct: 22 },
+          { name: "周总额度", pct: 54 }
+        ]
+      },
+      {
+        id: "claude-2",
+        platform: "claude",
+        alias: "轻度免费号",
+        email: "free.note@gmail.com",
+        tier: "free",
+        planLabel: "Free",
+        primaryPct: 95,
+        resetIn: "4小时50分后重置",
+        subPools: [
+          { name: "当前窗口剩余", pct: 95 }
+        ]
+      },
+      {
+        id: "cc-1",
+        platform: "commandcode",
+        alias: "GOAT 主力号",
+        email: "goat.dev@gmail.com",
+        tier: "paid",
+        planLabel: "GOAT",
+        primaryPct: 74,
+        resetIn: "3小时50分后重置",
+        subPools: [
+          { name: "5小时窗口（月额 20%）", pct: 74 },
+          { name: "7天周窗口（月额 50%）", pct: 66 },
+          { name: "月度额度 + 充值余额", pct: 82 }
+        ]
+      },
+      {
+        id: "oc-1",
+        platform: "opencode",
+        alias: "Go 常用号",
+        email: "opencode.go@gmail.com",
+        tier: "paid",
+        planLabel: "Go",
+        primaryPct: 58,
+        resetIn: "2小时15分后重置",
+        subPools: [
+          { name: "5小时窗口（月额 20%）", pct: 58 },
+          { name: "7天周窗口（月额 50%）", pct: 71 },
+          { name: "月度额度 / Console 余额", pct: 85 }
+        ]
+      }
+    ];
+
+    let state = {
+      mode: "panel", // "panel" | "orb" | "edge"
+      filterPlatform: "all",
+      filterTier: "all",
+      privacy: false,
+      expandedId: "agy-1",
+      modalPlatform: "antigravity",
+      accounts: JSON.parse(JSON.stringify(INITIAL_ACCOUNTS))
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    function showToast(msg) {
+      const t = $("toast");
+      t.textContent = msg;
+      t.classList.remove("opacity-0", "translate-y-3");
+      clearTimeout(window._toastTimer);
+      window._toastTimer = setTimeout(() => {
+        t.classList.add("opacity-0", "translate-y-3");
+      }, 2100);
+    }
+
+    function maskEmail(email) {
+      if (!state.privacy) return email;
+      const [user, domain] = email.split("@");
+      if (!domain) return "••••••";
+      return user.slice(0, 2) + "•••@" + domain;
+    }
+
+    function getBarColorClass(pct) {
+      if (pct <= 25) return "bg-gradient-to-r from-rose-500 to-orange-400";
+      if (pct <= 55) return "bg-gradient-to-r from-amber-400 to-yellow-300";
+      return "bg-gradient-to-r from-sky-400 to-indigo-400";
+    }
+
+    function getPctTextColor(pct) {
+      if (pct <= 25) return "text-rose-400";
+      if (pct <= 55) return "text-amber-400";
+      return "text-sky-400";
+    }
+
+    function updateSummaryMetrics() {
+      const list = state.accounts;
+      const avg = list.length
+        ? Math.round(list.reduce((s, a) => s + a.primaryPct, 0) / list.length)
+        : 0;
+      const lowest = list.length
+        ? list.reduce((min, a) => (a.primaryPct < min.primaryPct ? a : min), list[0])
+        : null;
+      const lowCount = list.filter((a) => a.primaryPct <= 25).length;
+
+      $("accountCountBadge").textContent = `${list.length} 账号`;
+      $("orbCenterPct").textContent = `${avg}%`;
+      $("orbTooltipPct").textContent = `${avg}%`;
+      $("edgePct").textContent = `${avg}%`;
+
+      if (lowest) {
+        $("orbTooltipSub").textContent = `最低项：${lowest.alias} ${lowest.primaryPct}% · 点击展开`;
+      }
+
+      const circ = 150.8;
+      $("orbRing").style.strokeDashoffset = (circ * (1 - avg / 100)).toFixed(1);
+
+      const alertEl = $("footerLowAlert");
+      if (lowCount > 0) {
+        alertEl.textContent = `${lowCount} 个账号额度偏低`;
+        alertEl.className = "font-medium text-amber-400";
+        $("edgeStatusDot").className = "w-2 h-2 rounded-full bg-amber-400 animate-pulse";
+      } else {
+        alertEl.textContent = "全部账号状态健康";
+        alertEl.className = "font-medium text-emerald-400";
+        $("edgeStatusDot").className = "w-2 h-2 rounded-full bg-emerald-400";
+      }
+    }
+
+    function renderPlatformTabs() {
+      const container = $("platformTabs");
+      container.innerHTML = Object.entries(PLATFORMS).map(([key, info]) => {
+        const active = state.filterPlatform === key;
+        const count = key === "all"
+          ? state.accounts.length
+          : state.accounts.filter((a) => a.platform === key).length;
+        return `
+          <button type="button" data-platform="${key}"
+            class="plat-tab shrink-0 px-2 py-1 rounded-xl text-[11px] font-medium transition flex items-center gap-1.5 ${
+              active
+                ? "bg-sky-500/25 border border-sky-400/50 shadow-sm"
+                : "glass-card opacity-80 hover:opacity-100"
+            }">
+            <span class="w-1.5 h-1.5 rounded-full" style="background:${info.color}"></span>
+            <span>${info.name}</span>
+            <span class="text-[10px] opacity-65">${count}</span>
+          </button>
+        `;
+      }).join("");
+
+      container.querySelectorAll(".plat-tab").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.filterPlatform = btn.dataset.platform;
+          renderAll();
+        });
+      });
+    }
+
+    function renderCards() {
+      const container = $("cardsContainer");
+      const filtered = state.accounts.filter((acc) => {
+        const matchPlat = state.filterPlatform === "all" || acc.platform === state.filterPlatform;
+        const matchTier = state.filterTier === "all" || acc.tier === state.filterTier;
+        return matchPlat && matchTier;
+      });
+
+      if (!filtered.length) {
+        container.innerHTML = `
+          <div class="glass-card rounded-2xl p-6 text-center text-xs" style="color: var(--text-sub);">
+            当前筛选条件下暂无账号，点击右上角「+」即可添加。
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = filtered.map((acc) => {
+        const pInfo = PLATFORMS[acc.platform];
+        const expanded = state.expandedId === acc.id;
+        const tierBadge = acc.tier === "paid"
+          ? `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-indigo-500/25 text-indigo-300 border border-indigo-400/30">${acc.planLabel}</span>`
+          : `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-white/10 opacity-80">${acc.planLabel}</span>`;
+
+        const subHtml = expanded ? `
+          <div class="mt-3 pt-2.5 border-t border-white/10 space-y-2">
+            ${acc.subPools.map((sp) => `
+              <div>
+                <div class="flex justify-between text-[11px] mb-1">
+                  <span style="color: var(--text-sub);">${sp.name}</span>
+                  <span class="font-medium ${getPctTextColor(sp.pct)}">${sp.pct}%</span>
+                </div>
+                <div class="h-1.5 rounded-full bg-white/10 overflow-hidden">
+                  <div class="bar-fill h-full rounded-full ${getBarColorClass(sp.pct)}" style="width:${sp.pct}%"></div>
+                </div>
+              </div>
+            `).join("")}
+            <div class="flex items-center justify-between pt-1.5 text-[11px]" style="color: var(--text-sub);">
+              <span>${maskEmail(acc.email)}</span>
+              <button type="button" data-delete="${acc.id}" class="del-acc-btn text-rose-400 hover:text-rose-300 transition">移除</button>
+            </div>
+          </div>
+        ` : "";
+
+        return `
+          <div class="glass-card rounded-2xl p-3.5 cursor-pointer acc-card" data-id="${acc.id}">
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2 min-w-0">
+                <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background:${pInfo.color}; box-shadow: 0 0 10px ${pInfo.color};"></span>
+                <span class="text-xs font-semibold truncate">${pInfo.name} · ${acc.alias}</span>
+                ${tierBadge}
+              </div>
+              <div class="flex items-center gap-1.5 shrink-0">
+                <span class="text-sm font-bold ${getPctTextColor(acc.primaryPct)}">${acc.primaryPct}%</span>
+                <i data-lucide="${expanded ? "chevron-up" : "chevron-down"}" class="w-3.5 h-3.5 opacity-60"></i>
+              </div>
+            </div>
+
+            <div class="mt-2.5 h-2 rounded-full bg-white/10 overflow-hidden">
+              <div class="bar-fill h-full rounded-full ${getBarColorClass(acc.primaryPct)}" style="width:${acc.primaryPct}%"></div>
+            </div>
+
+            <div class="mt-1.5 flex items-center justify-between text-[11px]" style="color: var(--text-sub);">
+              <span>剩余主额度</span>
+              <span>${acc.resetIn}</span>
+            </div>
+            ${subHtml}
+          </div>
+        `;
+      }).join("");
+
+      container.querySelectorAll(".acc-card").forEach((card) => {
+        card.addEventListener("click", (e) => {
+          if (e.target.closest(".del-acc-btn")) return;
+          const id = card.dataset.id;
+          state.expandedId = state.expandedId === id ? null : id;
+          renderCards();
+          lucide.createIcons();
+        });
+      });
+
+      container.querySelectorAll(".del-acc-btn").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const id = btn.dataset.delete;
+          state.accounts = state.accounts.filter((a) => a.id !== id);
+          showToast("已移除该监控账号");
+          renderAll();
+        });
+      });
+    }
+
+    function applyMode(mode) {
+      state.mode = mode;
+      const panel = $("quotaPanel");
+      const orb = $("orbContainer");
+      const edge = $("edgeDockBtn");
+
+      panel.classList.toggle("panel-hidden", mode !== "panel");
+      orb.classList.toggle("hidden", mode !== "orb");
+      edge.classList.toggle("hidden", mode !== "edge");
+
+      // Sync demo buttons
+      ["demoModePanel", "demoModeOrb", "demoModeEdge"].forEach((id) => {
+        const el = $(id);
+        const active =
+          (id === "demoModePanel" && mode === "panel") ||
+          (id === "demoModeOrb" && mode === "orb") ||
+          (id === "demoModeEdge" && mode === "edge");
+        el.className = active
+          ? "px-3 py-1.5 rounded-xl text-xs font-medium bg-sky-500/25 border border-sky-400/40 transition"
+          : "px-3 py-1.5 rounded-xl text-xs font-medium glass-card";
+      });
+    }
+
+    function renderAll() {
+      renderPlatformTabs();
+      renderCards();
+      updateSummaryMetrics();
+      lucide.createIcons();
+    }
+
+    // Event bindings
+    $("btnToOrb").addEventListener("click", () => applyMode("orb"));
+    $("btnToEdge").addEventListener("click", () => applyMode("edge"));
+    $("edgeDockBtn").addEventListener("click", () => applyMode("panel"));
+    $("demoModePanel").addEventListener("click", () => applyMode("panel"));
+    $("demoModeOrb").addEventListener("click", () => applyMode("orb"));
+    $("demoModeEdge").addEventListener("click", () => applyMode("edge"));
+
+    // Draggable Floating Orb (distinguish click vs drag)
+    (function setupOrbDrag() {
+      const orbBox = $("orbContainer");
+      const orbBtn = $("orbButton");
+      let dragging = false, moved = false, startX = 0, startY = 0, origLeft = 0, origTop = 0;
+
+      orbBtn.addEventListener("pointerdown", (e) => {
+        dragging = true;
+        moved = false;
+        startX = e.clientX;
+        startY = e.clientY;
+        const rect = orbBox.getBoundingClientRect();
+        origLeft = rect.left;
+        origTop = rect.top;
+        orbBtn.setPointerCapture(e.pointerId);
+      });
+
+      orbBtn.addEventListener("pointermove", (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        if (Math.hypot(dx, dy) > 5) moved = true;
+        if (moved) {
+          orbBox.style.right = "auto";
+          orbBox.style.left = Math.max(8, Math.min(window.innerWidth - 72, origLeft + dx)) + "px";
+          orbBox.style.top = Math.max(8, Math.min(window.innerHeight - 72, origTop + dy)) + "px";
+        }
+      });
+
+      orbBtn.addEventListener("pointerup", () => {
+        if (!dragging) return;
+        dragging = false;
+        if (!moved) applyMode("panel");
+      });
+    })();
+
+    // Tier Filters
+    document.querySelectorAll(".tier-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.filterTier = btn.dataset.tier;
+        document.querySelectorAll(".tier-btn").forEach((b) => {
+          const active = b.dataset.tier === state.filterTier;
+          b.className = active
+            ? "tier-btn px-2.5 py-1 rounded-lg font-medium bg-white/15"
+            : "tier-btn px-2.5 py-1 rounded-lg font-medium opacity-70 hover:opacity-100";
+        });
+        renderCards();
+        lucide.createIcons();
+      });
+    });
+
+    // Privacy Toggle
+    $("btnTogglePrivacy").addEventListener("click", () => {
+      state.privacy = !state.privacy;
+      $("privacyLabel").textContent = state.privacy ? "已隐藏邮箱" : "隐私模式";
+      $("privacyIcon").setAttribute("data-lucide", state.privacy ? "eye-off" : "eye");
+      renderCards();
+      lucide.createIcons();
+    });
+
+    // Refresh
+    $("btnRefresh").addEventListener("click", () => {
+      const icon = $("refreshIcon");
+      icon.classList.add("spinning");
+      setTimeout(() => {
+        icon.classList.remove("spinning");
+        const now = new Date();
+        const hh = String(now.getHours()).padStart(2, "0");
+        const mm = String(now.getMinutes()).padStart(2, "0");
+        $("lastUpdatedText").textContent = `${hh}:${mm} 已同步 · 6 个平台`;
+        showToast("已刷新全部账号额度");
+      }, 650);
+    });
+
+    // Wallpaper Switcher
+    function setWallpaper(cls, isLight) {
+      document.body.classList.remove("wallpaper-nebula", "wallpaper-aurora", "wallpaper-frost", "theme-light");
+      document.body.classList.add(cls);
+      if (isLight) document.body.classList.add("theme-light");
+    }
+    $("bgNebula").addEventListener("click", () => setWallpaper("wallpaper-nebula", false));
+    $("bgAurora").addEventListener("click", () => setWallpaper("wallpaper-aurora", false));
+    $("bgFrost").addEventListener("click", () => setWallpaper("wallpaper-frost", true));
+
+    // Demo Drain & Reset
+    $("demoSimulateDrain").addEventListener("click", () => {
+      state.accounts.forEach((acc) => {
+        const drop = 12 + Math.floor(Math.random() * 14);
+        acc.primaryPct = Math.max(4, acc.primaryPct - drop);
+        acc.subPools.forEach((sp) => {
+          sp.pct = Math.max(4, sp.pct - Math.floor(drop * 0.9));
+        });
+      });
+      renderAll();
+      showToast("已模拟一轮高频使用后的额度变化");
+    });
+
+    $("demoResetData").addEventListener("click", () => {
+      state.accounts = JSON.parse(JSON.stringify(INITIAL_ACCOUNTS));
+      renderAll();
+      showToast("已恢复初始示例数据");
+    });
+
+    // Modal Logic
+    function openModal() {
+      $("addModal").classList.remove("hidden");
+      $("addModal").classList.add("flex");
+    }
+    function closeModal() {
+      $("addModal").classList.add("hidden");
+      $("addModal").classList.remove("flex");
+    }
+    $("btnAddAccount").addEventListener("click", openModal);
+    $("closeModalBtn").addEventListener("click", closeModal);
+    $("cancelModalBtn").addEventListener("click", closeModal);
+    $("addModal").addEventListener("click", (e) => {
+      if (e.target === $("addModal")) closeModal();
+    });
+
+    document.querySelectorAll(".plat-pick").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.modalPlatform = btn.dataset.plat;
+        document.querySelectorAll(".plat-pick").forEach((b) => {
+          const active = b.dataset.plat === state.modalPlatform;
+          b.className = active
+            ? "plat-pick px-3 py-2 rounded-xl glass-card text-left font-medium border-sky-400/60 bg-sky-500/20"
+            : "plat-pick px-3 py-2 rounded-xl glass-card text-left font-medium";
+        });
+        $("authHintText").textContent = PLATFORMS[state.modalPlatform].hint;
+      });
+    });
+
+    $("addAccountForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const alias = $("inputAlias").value.trim();
+      const email = $("inputEmail").value.trim();
+      const [tier, planLabel] = $("inputPlan").value.split("|");
+      const newPct = 88;
+      const newAcc = {
+        id: `${state.modalPlatform}-${Date.now()}`,
+        platform: state.modalPlatform,
+        alias,
+        email,
+        tier,
+        planLabel,
+        primaryPct: newPct,
+        resetIn: "4小时59分后重置",
+        subPools: [
+          { name: "当前主额度窗口", pct: newPct },
+          { name: "周期总额度", pct: 94 }
+        ]
+      };
+      state.accounts.unshift(newAcc);
+      state.expandedId = newAcc.id;
+      $("addAccountForm").reset();
+      closeModal();
+      renderAll();
+      showToast(`已添加 ${PLATFORMS[state.modalPlatform].name} · ${alias}`);
+    });
+
+    // Init
+    renderAll();
+    applyMode("panel");
+  </script>
+</body>
+</html>
