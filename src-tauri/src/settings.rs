@@ -16,6 +16,7 @@ pub struct AppSettings {
     pub auto_check_updates: bool,
     pub update_feed_url: String,
     pub polling_interval_secs: u64,
+    pub polling_migrated_v2: bool,
 }
 
 impl Default for AppSettings {
@@ -24,7 +25,8 @@ impl Default for AppSettings {
             theme: "dark".to_string(),
             auto_check_updates: true,
             update_feed_url: DEFAULT_UPDATE_FEED_URL.to_string(),
-            polling_interval_secs: 300,
+            polling_interval_secs: 15,
+            polling_migrated_v2: false,
         }
     }
 }
@@ -46,6 +48,18 @@ impl SettingsStore {
         };
 
         let mut needs_write = !path.exists();
+        if !settings.polling_migrated_v2 {
+            if settings.polling_interval_secs == 300 {
+                settings.polling_interval_secs = 15;
+            }
+            settings.polling_migrated_v2 = true;
+            needs_write = true;
+        }
+        let clamped = settings.polling_interval_secs.clamp(5, 3600);
+        if clamped != settings.polling_interval_secs {
+            settings.polling_interval_secs = clamped;
+            needs_write = true;
+        }
         if settings.update_feed_url.trim().is_empty()
             || settings.update_feed_url.trim() == LEGACY_GITHUB_API_FEED
         {
@@ -104,11 +118,43 @@ impl SettingsStore {
             } else {
                 trimmed_feed.to_string()
             },
-            polling_interval_secs: next.polling_interval_secs.clamp(60, 3600),
+            polling_interval_secs: next.polling_interval_secs.clamp(5, 3600),
+            polling_migrated_v2: true,
         };
 
         self.write_settings(&sanitized)?;
         *guard = sanitized.clone();
         Ok(sanitized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_legacy_300s_once_and_preserves_explicit_choice() {
+        let dir = std::env::temp_dir().join(format!(
+            "auraquota_settings_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let legacy_json = r#"{"theme":"dark","pollingIntervalSecs":300}"#;
+        fs::write(dir.join("settings.json"), legacy_json).expect("write legacy settings");
+
+        let store = SettingsStore::from_app_data_dir(&dir).expect("load settings");
+        assert_eq!(store.get().polling_interval_secs, 15);
+        assert!(store.get().polling_migrated_v2);
+
+        // User explicitly selects 300s after migration -> stays 300s on reload
+        let mut next = store.get();
+        next.polling_interval_secs = 300;
+        store.save(next).expect("save 300s");
+
+        let reloaded = SettingsStore::from_app_data_dir(&dir).expect("reload settings");
+        assert_eq!(reloaded.get().polling_interval_secs, 300);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

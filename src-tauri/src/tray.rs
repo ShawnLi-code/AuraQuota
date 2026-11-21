@@ -122,7 +122,11 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), String> {
                             store: Some(Arc::clone(&store)),
                         };
                         if let Ok(_accounts) = registry.refresh_all(&store, &ctx).await {
-                            if let Ok(snap) = store.build_snapshot(300, now_hh_mm()) {
+                            let poll_secs = handle
+                                .try_state::<Arc<crate::settings::SettingsStore>>()
+                                .map(|s| s.get().polling_interval_secs)
+                                .unwrap_or(15);
+                            if let Ok(snap) = store.build_snapshot(poll_secs, now_hh_mm()) {
                                 let _ = handle.emit("quota-updated", snap);
                             }
                         }

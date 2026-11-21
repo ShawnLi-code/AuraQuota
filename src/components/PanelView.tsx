@@ -23,6 +23,7 @@ interface PanelViewProps {
   activeReason: string | null;
   lastActiveMap: Record<string, number>;
   lastUpdatedAt: string;
+  pollingIntervalSecs?: number;
   privacy: boolean;
   theme: 'dark' | 'light';
   expandedId: string | null;
@@ -51,6 +52,7 @@ export const PanelView: React.FC<PanelViewProps> = ({
   activeReason,
   lastActiveMap,
   lastUpdatedAt,
+  pollingIntervalSecs = 15,
   privacy,
   theme,
   expandedId,
@@ -85,7 +87,15 @@ export const PanelView: React.FC<PanelViewProps> = ({
 
   const isManuallyPinned =
     spotlightAccount !== null && spotlightAccount.id === pinnedAccountId;
-  const lowCount = accounts.filter((a) => a.primaryPct <= 25).length;
+  const authRequiredCount = accounts.filter((a) => a.status === 'auth_required').length;
+  const offlineCount = accounts.filter(
+    (a) => a.status === 'offline' || a.status === 'error'
+  ).length;
+  const lowCount = accounts.filter((a) => a.status === 'ok' && a.primaryPct <= 25).length;
+  const pollLabel =
+    pollingIntervalSecs < 60
+      ? `${pollingIntervalSecs}s 实时`
+      : `${Math.round(pollingIntervalSecs / 60)}m 轮询`;
   const hasDemo = accounts.some((a) => a.isDemo);
   const realCount = accounts.filter((a) => !a.isDemo).length;
   const frameRadius = isTauriRuntime() ? 'rounded-[8px]' : 'rounded-3xl';
@@ -336,9 +346,15 @@ export const PanelView: React.FC<PanelViewProps> = ({
           borderTop: '1px solid var(--divider)',
         }}
       >
-        <div className="flex items-center gap-2">
-          <span>{realCount > 0 ? `仅刷新已有 ${realCount} 号` : '示例预览中'}</span>
-          {lowCount > 0 ? (
+        <div className="flex items-center gap-1.5 min-w-0 truncate">
+          <span>
+            {realCount > 0 ? `仅刷新已有 ${realCount} 号 · ${pollLabel}` : '示例预览中'}
+          </span>
+          {authRequiredCount > 0 ? (
+            <span className="font-medium text-rose-400">· {authRequiredCount} 号需重登</span>
+          ) : offlineCount > 0 ? (
+            <span className="font-medium text-amber-400">· {offlineCount} 号异常</span>
+          ) : lowCount > 0 ? (
             <span className="font-medium" style={{ color: 'var(--pct-mid)' }}>
               · {lowCount} 项偏低
             </span>

@@ -48,7 +48,11 @@ fn build_ctx(
 }
 
 fn emit_snapshot(app: &AppHandle, store: &AccountStore) {
-    if let Ok(snap) = store.build_snapshot(300, now_hh_mm()) {
+    let poll_secs = app
+        .try_state::<Arc<SettingsStore>>()
+        .map(|s| s.get().polling_interval_secs)
+        .unwrap_or(15);
+    if let Ok(snap) = store.build_snapshot(poll_secs, now_hh_mm()) {
         let _ = app.emit("quota-updated", snap);
     }
 }
@@ -237,8 +241,9 @@ async fn save_oauth_browser_account(
 #[tauri::command]
 pub async fn get_quota_snapshot(
     store: State<'_, Arc<AccountStore>>,
+    settings: State<'_, Arc<SettingsStore>>,
 ) -> Result<QuotaSnapshot, String> {
-    store.build_snapshot(300, now_hh_mm())
+    store.build_snapshot(settings.get().polling_interval_secs, now_hh_mm())
 }
 
 #[tauri::command]
@@ -248,11 +253,12 @@ pub async fn refresh_all_quotas(
     registry: State<'_, Arc<ProviderRegistry>>,
     bridge: State<'_, Arc<WebviewBridgeStore>>,
     tracker: State<'_, Arc<AlertTracker>>,
+    settings: State<'_, Arc<SettingsStore>>,
 ) -> Result<QuotaSnapshot, String> {
     let ctx = build_ctx(&app, &bridge, &store);
     let accounts = registry.refresh_all(&store, &ctx).await?;
     tracker.check_and_notify(&app, &accounts);
-    let snap = store.build_snapshot(300, now_hh_mm())?;
+    let snap = store.build_snapshot(settings.get().polling_interval_secs, now_hh_mm())?;
     let _ = app.emit("quota-updated", snap.clone());
     Ok(snap)
 }
@@ -283,9 +289,10 @@ pub async fn toggle_pin_account(
     app: AppHandle,
     account_id: String,
     store: State<'_, Arc<AccountStore>>,
+    settings: State<'_, Arc<SettingsStore>>,
 ) -> Result<QuotaSnapshot, String> {
     store.toggle_pin_account(&account_id)?;
-    let snap = store.build_snapshot(300, now_hh_mm())?;
+    let snap = store.build_snapshot(settings.get().polling_interval_secs, now_hh_mm())?;
     let _ = app.emit("quota-updated", snap.clone());
     Ok(snap)
 }
@@ -295,9 +302,10 @@ pub async fn set_active_account(
     app: AppHandle,
     account_id: String,
     store: State<'_, Arc<AccountStore>>,
+    settings: State<'_, Arc<SettingsStore>>,
 ) -> Result<QuotaSnapshot, String> {
     let _ = store.set_active_account(&account_id, "当前选中焦点", true)?;
-    let snap = store.build_snapshot(300, now_hh_mm())?;
+    let snap = store.build_snapshot(settings.get().polling_interval_secs, now_hh_mm())?;
     let _ = app.emit("quota-updated", snap.clone());
     Ok(snap)
 }
@@ -392,17 +400,19 @@ pub async fn remove_account(
 #[tauri::command]
 pub async fn clear_demo_accounts(
     store: State<'_, Arc<AccountStore>>,
+    settings: State<'_, Arc<SettingsStore>>,
 ) -> Result<QuotaSnapshot, String> {
     store.clear_demo_accounts()?;
-    store.build_snapshot(300, now_hh_mm())
+    store.build_snapshot(settings.get().polling_interval_secs, now_hh_mm())
 }
 
 #[tauri::command]
 pub async fn restore_demo_accounts(
     store: State<'_, Arc<AccountStore>>,
+    settings: State<'_, Arc<SettingsStore>>,
 ) -> Result<QuotaSnapshot, String> {
     store.restore_demo_accounts()?;
-    store.build_snapshot(300, now_hh_mm())
+    store.build_snapshot(settings.get().polling_interval_secs, now_hh_mm())
 }
 
 fn agy_account_id_for_email(email: &str) -> String {
@@ -1294,12 +1304,14 @@ pub async fn save_app_settings(
     app: AppHandle,
     next: AppSettings,
     settings: State<'_, Arc<SettingsStore>>,
+    store: State<'_, Arc<AccountStore>>,
     win_state: State<'_, WindowState>,
 ) -> Result<AppSettings, String> {
     let saved = settings.save(next)?;
     if let Some(win) = app.get_webview_window("main") {
         apply_theme_vibrancy(&win, &win_state, &saved.theme);
     }
+    emit_snapshot(&app, &store);
     Ok(saved)
 }
 

@@ -54,7 +54,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     theme,
     autoCheckUpdates: true,
     updateFeedUrl: '',
-    pollingIntervalSecs: 300,
+    pollingIntervalSecs: 15,
   });
   const [autostart, setAutostart] = useState(false);
 
@@ -372,7 +372,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-2">
             <label htmlFor={pollId} style={{ color: 'var(--text-sub)' }}>
               自动轮询频率
             </label>
@@ -384,11 +384,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               }
               className="aura-select px-2 py-1 rounded-lg text-[11px]"
             >
+              <option value={5}>每 5 秒（极速 · 本机实时）</option>
+              <option value={15}>每 15 秒（实时聚焦 · 推荐）</option>
+              <option value={30}>每 30 秒（高频）</option>
+              <option value={60}>每 1 分钟</option>
               <option value={180}>每 3 分钟</option>
-              <option value={300}>每 5 分钟</option>
-              <option value={600}>每 10 分钟</option>
+              <option value={300}>每 5 分钟（省流）</option>
             </select>
           </div>
+          <p className="text-[10px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+            高频模式优先秒刷本机运行中的焦点应用；云端 API 最快每 10 秒、WebView 网页抓取最快每 60 秒自动限频，兼顾实时变化与防风控。
+          </p>
 
           <div className="flex items-center justify-between">
             <span style={{ color: 'var(--text-sub)' }}>开机自动启动</span>
@@ -427,7 +433,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         >
           <div className="flex items-center justify-between">
             <span className="font-semibold">
-              应用更新 <span className="font-normal opacity-75">v{updateResult?.currentVersion ?? '0.3.5'}</span>
+              应用更新 <span className="font-normal opacity-75">v{updateResult?.currentVersion ?? '0.3.6'}</span>
             </span>
             <button
               type="button"

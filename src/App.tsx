@@ -43,6 +43,7 @@ export const App: React.FC = () => {
   const [activeReason, setActiveReason] = useState<string | null>(null);
   const [lastActiveMap, setLastActiveMap] = useState<Record<string, number>>({});
   const [lastUpdatedAt, setLastUpdatedAt] = useState('刚刚');
+  const [pollingIntervalSecs, setPollingIntervalSecs] = useState(15);
   const [privacy, setPrivacy] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [refreshingAll, setRefreshingAll] = useState(false);
@@ -80,6 +81,9 @@ export const App: React.FC = () => {
     if (snap.lastActiveMap) {
       setLastActiveMap(snap.lastActiveMap);
     }
+    if (typeof snap.pollingIntervalSecs === 'number' && snap.pollingIntervalSecs > 0) {
+      setPollingIntervalSecs(snap.pollingIntervalSecs);
+    }
   }, []);
 
   useEffect(() => {
@@ -100,6 +104,9 @@ export const App: React.FC = () => {
     void getAppSettings().then((s) => {
       if (s.theme === 'light' || s.theme === 'dark') {
         setTheme(s.theme);
+      }
+      if (typeof s.pollingIntervalSecs === 'number' && s.pollingIntervalSecs > 0) {
+        setPollingIntervalSecs(s.pollingIntervalSecs);
       }
     });
 
@@ -343,6 +350,7 @@ export const App: React.FC = () => {
           activeReason={activeReason}
           lastActiveMap={lastActiveMap}
           lastUpdatedAt={lastUpdatedAt}
+          pollingIntervalSecs={pollingIntervalSecs}
           privacy={privacy}
           theme={theme}
           expandedId={expandedId}

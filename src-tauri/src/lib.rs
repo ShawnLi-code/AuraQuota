@@ -75,6 +75,7 @@ pub fn run() {
                 registry,
                 bridge,
                 tracker,
+                settings_store,
             );
             active_tracker::spawn_active_window_watcher(app.handle().clone(), Arc::clone(&store));
 

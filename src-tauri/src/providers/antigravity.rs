@@ -14,6 +14,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
+const ANTIGRAVITY_PUBLIC_CLIENT_ID: &str =
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+
 #[derive(Debug, Clone)]
 pub struct LocalServerInfo {
     pub pid: u32,
@@ -422,6 +425,118 @@ impl AntigravityProvider {
 
         Err((AccountStatus::Error, last_err))
     }
+
+    async fn try_fetch_oauth_or_refresh(
+        &self,
+        record: &StoredAccountRecord,
+        creds: Option<&SecretCredentials>,
+        ctx: &ProviderContext,
+        tried_tokens: &mut HashSet<String>,
+    ) -> Result<(AccountQuota, bool), (AccountStatus, String)> {
+        let initial_tok = creds
+            .and_then(|c| c.access_token.as_deref())
+            .filter(|s| !s.is_empty());
+
+        let mut last_err: Option<(AccountStatus, String)> = None;
+        if let Some(tok) = initial_tok {
+            if tried_tokens.insert(tok.to_string()) {
+                match self.fetch_from_oauth(record, tok).await {
+                    Ok(q) => return Ok((q, false)),
+                    Err((AccountStatus::AuthRequired, msg)) => {
+                        last_err = Some((AccountStatus::AuthRequired, msg));
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }
+
+        if let (Some(c), Some(rt)) = (
+            creds,
+            creds
+                .and_then(|c| c.refresh_token.as_deref())
+                .filter(|s| !s.is_empty()),
+        ) {
+            let cid = c
+                .oauth_client_id
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(ANTIGRAVITY_PUBLIC_CLIENT_ID);
+            if let Ok(new_tok) = refresh_google_oauth_token(
+                &self.cloud_client,
+                rt,
+                cid,
+                c.oauth_client_secret.as_deref(),
+            )
+            .await
+            {
+                if tried_tokens.insert(new_tok.clone()) {
+                    let mut updated_creds = c.clone();
+                    updated_creds.access_token = Some(new_tok.clone());
+                    if let Some(store) = ctx.store.as_ref() {
+                        let _ = store.update_credentials(&record.id, &updated_creds, None);
+                    }
+                    match self.fetch_from_oauth(record, &new_tok).await {
+                        Ok(q) => return Ok((q, true)),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            (
+                AccountStatus::AuthRequired,
+                "缺少 Antigravity OAuth Token".to_string(),
+            )
+        }))
+    }
+
+    async fn try_recover_from_offline_candidates(
+        &self,
+        record: &StoredAccountRecord,
+        ctx: &ProviderContext,
+        tried_tokens: &mut HashSet<String>,
+        attach_offline_note: bool,
+    ) -> Result<AccountQuota, (AccountStatus, String)> {
+        let candidates = tokio::task::spawn_blocking(discover_antigravity_offline_candidates)
+            .await
+            .map_err(|e| (AccountStatus::Error, format!("读取离线缓存失败: {e}")))?
+            .map_err(|e| (AccountStatus::Error, e))?;
+
+        let mut last_oauth_err: Option<(AccountStatus, String)> = None;
+        for cand in candidates {
+            if !email_matches_strict(&record.email, &cand.email) {
+                continue;
+            }
+            match self
+                .try_fetch_oauth_or_refresh(record, Some(&cand.creds), ctx, tried_tokens)
+                .await
+            {
+                Ok((mut q, refreshed)) => {
+                    if is_placeholder_agy_email(&q.email) {
+                        q.email = cand.email;
+                    }
+                    if attach_offline_note {
+                        q.status_message = Some(format!("离线读取：{}", cand.source_desc));
+                    }
+                    if !refreshed {
+                        if let Some(store) = ctx.store.as_ref() {
+                            let _ = store.update_credentials(&record.id, &cand.creds, None);
+                        }
+                    }
+                    return Ok(q);
+                }
+                Err(e) => last_oauth_err = Some(e),
+            }
+        }
+
+        Err(last_oauth_err.unwrap_or_else(|| {
+            (
+                AccountStatus::AuthRequired,
+                "未找到匹配的离线授权凭据".to_string(),
+            )
+        }))
+    }
 }
 
 fn is_placeholder_agy_email(email: &str) -> bool {
@@ -449,112 +564,47 @@ impl QuotaProvider for AntigravityProvider {
         creds: Option<&SecretCredentials>,
         ctx: &ProviderContext,
     ) -> AccountQuota {
+        let mut tried_tokens = HashSet::new();
         match record.auth_method {
             AuthMethod::OauthToken => {
-                let initial_tok = creds
-                    .and_then(|c| c.access_token.as_deref())
-                    .filter(|s| !s.is_empty());
-
-                let mut tried_tokens = HashSet::new();
-
-                if let Some(tok) = initial_tok {
-                    tried_tokens.insert(tok.to_string());
-                    match self.fetch_from_oauth(record, tok).await {
-                        Ok(q) => return q,
-                        Err((AccountStatus::AuthRequired, _)) => {
-                            // 1. Try refreshing Google OAuth token if refresh_token + client_id exist
-                            if let (Some(c), Some(rt)) = (
-                                creds,
-                                creds
-                                    .and_then(|c| c.refresh_token.as_deref())
-                                    .filter(|s| !s.is_empty()),
-                            ) {
-                                if let Some(cid) =
-                                    c.oauth_client_id.as_deref().filter(|s| !s.is_empty())
-                                {
-                                    if let Ok(new_tok) = refresh_google_oauth_token(
-                                        &self.cloud_client,
-                                        rt,
-                                        cid,
-                                        c.oauth_client_secret.as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        let mut updated_creds = c.clone();
-                                        updated_creds.access_token = Some(new_tok.clone());
-                                        if let Some(store) = ctx.store.as_ref() {
-                                            let _ = store.update_credentials(
-                                                &record.id,
-                                                &updated_creds,
-                                                None,
-                                            );
-                                        }
-                                        if let Ok(q) = self.fetch_from_oauth(record, &new_tok).await
-                                        {
-                                            return q;
-                                        }
-                                    }
+                match self
+                    .try_fetch_oauth_or_refresh(record, creds, ctx, &mut tried_tokens)
+                    .await
+                {
+                    Ok((q, _)) => q,
+                    Err((AccountStatus::AuthRequired, _)) => {
+                        // For auto-discovered local accounts, only renew from local server / offline cache if email matches
+                        if record.id.starts_with("agy-local") {
+                            if let Ok(q) = self.fetch_from_local_server(record).await {
+                                if email_matches_strict(&record.email, &q.email) {
+                                    return q;
                                 }
                             }
-
-                            // 2. For auto-discovered local accounts, only renew from local server / offline cache if email matches
-                            if record.id.starts_with("agy-local") {
-                                if let Ok(q) = self.fetch_from_local_server(record).await {
-                                    if email_matches_strict(&record.email, &q.email) {
-                                        return q;
-                                    }
-                                }
-                                if let Ok(Ok(candidates)) =
-                                    tokio::task::spawn_blocking(discover_antigravity_offline_candidates)
-                                        .await
-                                {
-                                    for cand in candidates {
-                                        if !email_matches_strict(&record.email, &cand.email) {
-                                            continue;
-                                        }
-                                        let Some(new_tok) = cand.creds.access_token.as_deref() else {
-                                            continue;
-                                        };
-                                        if !tried_tokens.insert(new_tok.to_string()) {
-                                            continue;
-                                        }
-                                        if let Ok(mut q) =
-                                            self.fetch_from_oauth(record, new_tok).await
-                                        {
-                                            if is_placeholder_agy_email(&q.email) {
-                                                q.email = cand.email;
-                                            }
-                                            if let Some(store) = ctx.store.as_ref() {
-                                                let _ = store.update_credentials(
-                                                    &record.id,
-                                                    &cand.creds,
-                                                    None,
-                                                );
-                                            }
-                                            return q;
-                                        }
-                                    }
-                                }
-                            }
-
-                            let msg = if is_placeholder_agy_email(&record.email) {
-                                "Antigravity 登录态已过期，请打开 Antigravity 客户端刷新登录后点「重登」".to_string()
-                            } else {
-                                format!(
-                                    "{} 的本地授权已过期，请在 Antigravity 客户端登录此号后点「刷新 / 重登」",
-                                    record.email
+                            if let Ok(q) = self
+                                .try_recover_from_offline_candidates(
+                                    record,
+                                    ctx,
+                                    &mut tried_tokens,
+                                    false,
                                 )
-                            };
-                            return make_error_quota(record, AccountStatus::AuthRequired, msg);
+                                .await
+                            {
+                                return q;
+                            }
                         }
-                        Err((st, msg)) => return make_error_quota(record, st, msg),
+
+                        let msg = if is_placeholder_agy_email(&record.email) {
+                            "Antigravity 登录态已过期，请打开 Antigravity 客户端刷新登录后点「重登」".to_string()
+                        } else {
+                            format!(
+                                "{} 的本地授权已过期，请在 Antigravity 客户端登录此号后点「刷新 / 重登」",
+                                record.email
+                            )
+                        };
+                        make_error_quota(record, AccountStatus::AuthRequired, msg)
                     }
+                    Err((st, msg)) => make_error_quota(record, st, msg),
                 }
-                make_error_quota(
-                    record,
-                    AccountStatus::AuthRequired,
-                    "缺少 Antigravity OAuth Token",
-                )
             }
             _ => {
                 // 1. Try running language_server first (only accept if email matches when record already has an email)
@@ -573,52 +623,26 @@ impl QuotaProvider for AntigravityProvider {
                             Err((_, e)) => e,
                         };
 
-                        // 2. Fallback to stored credentials if attached, then matching offline candidates
-                        if let Some(tok) = creds
-                            .and_then(|c| c.access_token.as_deref())
-                            .filter(|s| !s.is_empty())
+                        // 2. Fallback to stored credentials (with refresh_token attempt), then matching offline candidates
+                        if let Ok((q, _)) = self
+                            .try_fetch_oauth_or_refresh(record, creds, ctx, &mut tried_tokens)
+                            .await
                         {
-                            if let Ok(q) = self.fetch_from_oauth(record, tok).await {
-                                return q;
-                            }
+                            return q;
                         }
 
-                        if let Ok(Ok(candidates)) =
-                            tokio::task::spawn_blocking(discover_antigravity_offline_candidates)
-                                .await
+                        if let Ok(q) = self
+                            .try_recover_from_offline_candidates(
+                                record,
+                                ctx,
+                                &mut tried_tokens,
+                                true,
+                            )
+                            .await
                         {
-                            let mut last_oauth_err: Option<(AccountStatus, String)> = None;
-                            for cand in candidates {
-                                if !email_matches_strict(&record.email, &cand.email) {
-                                    continue;
-                                }
-                                if let Some(tok) = cand.creds.access_token.as_deref() {
-                                    match self.fetch_from_oauth(record, tok).await {
-                                        Ok(mut q) => {
-                                            if is_placeholder_agy_email(&q.email) {
-                                                q.email = cand.email;
-                                            }
-                                            q.status_message =
-                                                Some(format!("离线读取：{}", cand.source_desc));
-                                            if let Some(store) = ctx.store.as_ref() {
-                                                let _ = store.update_credentials(
-                                                    &record.id,
-                                                    &cand.creds,
-                                                    None,
-                                                );
-                                            }
-                                            return q;
-                                        }
-                                        Err(e) => {
-                                            last_oauth_err = Some(e);
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some((st, oauth_err)) = last_oauth_err {
-                                return make_error_quota(record, st, oauth_err);
-                            }
+                            return q;
                         }
+
                         let status = if mismatch_email.is_some() {
                             AccountStatus::AuthRequired
                         } else {

@@ -4,7 +4,7 @@ use crate::providers::now_hh_mm;
 use crate::storage::AccountStore;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub fn classify_foreground_platform(exe_name: &str, window_title: &str) -> Option<PlatformId> {
     let exe = exe_name.trim().to_lowercase();
@@ -274,7 +274,11 @@ pub fn spawn_active_window_watcher(app: AppHandle, store: Arc<AccountStore>) {
 
             let reason = format!("{} 使用中", platform.display_name());
             if let Ok(true) = store.set_active_account(&target_id, &reason, false) {
-                if let Ok(snap) = store.build_snapshot(300, now_hh_mm()) {
+                let poll_secs = app
+                    .try_state::<Arc<crate::settings::SettingsStore>>()
+                    .map(|s| s.get().polling_interval_secs)
+                    .unwrap_or(15);
+                if let Ok(snap) = store.build_snapshot(poll_secs, now_hh_mm()) {
                     let _ = app.emit("quota-updated", snap);
                 }
             }

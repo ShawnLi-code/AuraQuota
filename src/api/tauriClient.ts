@@ -106,7 +106,7 @@ let browserSettings: AppSettings = {
   theme: 'dark',
   autoCheckUpdates: true,
   updateFeedUrl: DEFAULT_GITHUB_FEED,
-  pollingIntervalSecs: 300,
+  pollingIntervalSecs: 15,
 };
 
 export async function getQuotaSnapshot(): Promise<QuotaSnapshot> {
@@ -114,7 +114,7 @@ export async function getQuotaSnapshot(): Promise<QuotaSnapshot> {
     return {
       accounts: browserDemoState,
       lastUpdatedAt: '预览',
-      pollingIntervalSecs: 300,
+      pollingIntervalSecs: 15,
       activeAccountId: browserDemoState[0]?.id ?? null,
       activeReason: '反重力 · 使用中',
     };
@@ -127,7 +127,7 @@ export async function refreshAllQuotas(): Promise<QuotaSnapshot> {
     return {
       accounts: browserDemoState,
       lastUpdatedAt: '刚刚',
-      pollingIntervalSecs: 300,
+      pollingIntervalSecs: 15,
       activeAccountId: browserDemoState[0]?.id ?? null,
       activeReason: '反重力 · 使用中',
     };
@@ -149,7 +149,7 @@ export async function togglePinAccount(accountId: string): Promise<QuotaSnapshot
     return {
       accounts: browserDemoState,
       lastUpdatedAt: '刚刚',
-      pollingIntervalSecs: 300,
+      pollingIntervalSecs: 15,
       activeAccountId: accountId,
       pinnedAccountId: accountId,
       activeReason: '已手动置顶',
@@ -163,7 +163,7 @@ export async function setActiveAccount(accountId: string): Promise<QuotaSnapshot
     return {
       accounts: browserDemoState,
       lastUpdatedAt: '刚刚',
-      pollingIntervalSecs: 300,
+      pollingIntervalSecs: 15,
       activeAccountId: accountId,
       activeReason: '当前选中焦点',
     };
@@ -210,7 +210,7 @@ export async function clearDemoAccounts(): Promise<QuotaSnapshot> {
     return {
       accounts: browserDemoState,
       lastUpdatedAt: '刚刚',
-      pollingIntervalSecs: 300,
+      pollingIntervalSecs: 15,
     };
   }
   return invoke<QuotaSnapshot>('clear_demo_accounts');
@@ -222,7 +222,7 @@ export async function restoreDemoAccounts(): Promise<QuotaSnapshot> {
     return {
       accounts: browserDemoState,
       lastUpdatedAt: '刚刚',
-      pollingIntervalSecs: 300,
+      pollingIntervalSecs: 15,
     };
   }
   return invoke<QuotaSnapshot>('restore_demo_accounts');
@@ -399,7 +399,7 @@ export async function saveAppSettings(next: AppSettings): Promise<AppSettings> {
 export async function checkForUpdates(feedUrl?: string): Promise<UpdateCheckResult> {
   if (!isTauriRuntime()) {
     return {
-      currentVersion: '0.3.5',
+      currentVersion: '0.3.6',
       hasUpdate: false,
       message: '浏览器预览模式不检查更新',
       configured: false,
