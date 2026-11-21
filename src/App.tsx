@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   captureAuthWebview,
   clearDemoAccounts,
-  detectAntigravityLocal,
   getAppSettings,
   getQuotaSnapshot,
   isTauriRuntime,
@@ -278,19 +277,11 @@ export const App: React.FC = () => {
       return;
     }
 
-    if (
-      acc.platform === 'antigravity' &&
-      (acc.id.startsWith('agy-local') || acc.authMethod === 'local_server')
-    ) {
-      showToast('正在重新读取本机反重力登录态...');
-      try {
-        const res = await detectAntigravityLocal(acc.alias);
-        const snap = await getQuotaSnapshot();
-        applySnapshot(snap);
-        showToast(res.message);
-      } catch (e) {
-        showToast(e instanceof Error ? e.message : String(e));
-      }
+    if (acc.platform === 'antigravity') {
+      setAddDefaultPlatform('antigravity');
+      setAddInitialMode('default_browser');
+      setRebindOAuthAccount(acc);
+      setAddOpen(true);
       return;
     }
 

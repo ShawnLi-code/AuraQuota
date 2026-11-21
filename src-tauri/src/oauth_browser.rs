@@ -1,4 +1,7 @@
 use crate::models::{ClaudeOAuthStartResult, SecretCredentials, SubscriptionTier};
+use crate::providers::antigravity::{
+    fetch_google_userinfo_email, resolve_builtin_antigravity_oauth_clients, AntigravityProvider,
+};
 use crate::providers::claude::CLAUDE_OAUTH_CLIENT_ID;
 use crate::providers::codex::{parse_openai_jwt_claims, CODEX_OAUTH_CLIENT_ID};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -21,6 +24,7 @@ const CLAUDE_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/call
 const CLAUDE_SCOPE: &str = "org:create_api_key user:profile user:inference";
 const CODEX_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const CODEX_SCOPE: &str = "openid profile email offline_access";
+const ANTIGRAVITY_SCOPE: &str = "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 
 #[derive(Debug, Clone)]
 pub struct PendingClaudeFlow {
@@ -275,7 +279,7 @@ async fn wait_for_oauth_callback(
 fn oauth_http_client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(15))
-        .user_agent("AuraQuota/0.3.6")
+        .user_agent("AuraQuota/0.3.7")
         .build()
         .unwrap_or_else(|_| Client::new())
 }
@@ -505,6 +509,132 @@ pub async fn complete_claude_browser_oauth(
     })
 }
 
+pub fn build_antigravity_auth_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+) -> Result<String, String> {
+    Url::parse_with_params(
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        &[
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("response_type", "code"),
+            ("scope", ANTIGRAVITY_SCOPE),
+            ("access_type", "offline"),
+            ("prompt", "consent select_account"),
+            ("include_granted_scopes", "true"),
+            ("code_challenge", code_challenge),
+            ("code_challenge_method", "S256"),
+            ("state", state),
+        ],
+    )
+    .map(|u| u.to_string())
+    .map_err(|e| format!("构造 Google 授权链接失败: {e}"))
+}
+
+pub async fn run_antigravity_browser_oauth(
+    app: &AppHandle,
+    pending: &PendingOAuthStore,
+) -> Result<BrowserOAuthAccountData, String> {
+    let clients = resolve_builtin_antigravity_oauth_clients();
+    let primary = clients.into_iter().next().ok_or_else(|| {
+        "未在本机检测到 Antigravity 客户端（language_server.exe），无法自动读取桌面端 OAuth 授权配置；请先安装 Antigravity 或改用手动 Token".to_string()
+    })?;
+
+    let (cancel_rx, had_prev) = pending.begin_loopback_slot();
+    if had_prev {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("无法绑定本地 Google OAuth 回调端口: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("获取本地回调端口失败: {e}"))?
+        .port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/oauth-callback");
+
+    let (verifier, challenge) = generate_pkce_pair();
+    let state = generate_oauth_state();
+    let auth_url =
+        build_antigravity_auth_url(&primary.client_id, &redirect_uri, &state, &challenge)?;
+
+    app.opener()
+        .open_url(&auth_url, None::<&str>)
+        .map_err(|e| format!("打开系统默认浏览器失败: {e}"))?;
+
+    let code = wait_for_oauth_callback(listener, "/oauth-callback", &state, cancel_rx).await?;
+
+    let client = oauth_http_client();
+    let resp = client
+        .post("https://oauth2.googleapis.com/token")
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", primary.client_id.as_str()),
+            ("client_secret", primary.client_secret.as_str()),
+            ("code", code.as_str()),
+            ("code_verifier", verifier.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| {
+            format!("Google OAuth 换取 Token 失败（请检查本机网络/代理能否访问 googleapis.com）: {e}")
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Google OAuth 换取 Token 返回 HTTP {status}: {body}"));
+    }
+
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析 Google Token 响应失败: {e}"))?;
+
+    let access_token = json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Google 授权响应未包含 access_token".to_string())?;
+    let refresh_token = json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if refresh_token.is_none() {
+        return Err("Google 未返回永久 Refresh Token，请在授权确认页勾选全部权限后再试一次".to_string());
+    }
+
+    let email = fetch_google_userinfo_email(&client, &access_token).await;
+    let tier_meta = AntigravityProvider::new()
+        .probe_account_tier(&access_token)
+        .await;
+    let (tier, plan_label) = match tier_meta {
+        Some((t, lbl)) => (Some(t), Some(lbl)),
+        None => (None, None),
+    };
+
+    Ok(BrowserOAuthAccountData {
+        email,
+        plan_label,
+        tier,
+        creds: SecretCredentials {
+            access_token: Some(access_token),
+            refresh_token,
+            oauth_client_id: Some(primary.client_id),
+            ..Default::default()
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +684,31 @@ mod tests {
         assert_eq!(s2, None);
 
         assert!(split_claude_code_state("   ").is_err());
+    }
+
+    #[test]
+    fn builds_antigravity_offline_auth_url() {
+        let url = build_antigravity_auth_url(
+            "1071006060591-mock.apps.googleusercontent.com",
+            "http://127.0.0.1:45678/oauth-callback",
+            "state123",
+            "challengeXYZ",
+        )
+        .expect("build agy auth url");
+        let parsed = Url::parse(&url).expect("parse generated auth url");
+        let params: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(params.get("access_type").map(String::as_str), Some("offline"));
+        assert_eq!(
+            params.get("prompt").map(String::as_str),
+            Some("consent select_account")
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some("http://127.0.0.1:45678/oauth-callback")
+        );
     }
 }

@@ -112,6 +112,7 @@ pub fn run() {
             commands::open_in_default_browser,
             commands::open_auth_webview,
             commands::capture_auth_webview,
+            commands::start_antigravity_browser_oauth,
             commands::start_codex_browser_oauth,
             commands::start_claude_browser_oauth,
             commands::complete_claude_browser_oauth,

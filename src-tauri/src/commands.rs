@@ -13,6 +13,7 @@ use crate::models::{
 };
 use crate::oauth_browser::{
     complete_claude_browser_oauth as finish_claude_oauth,
+    run_antigravity_browser_oauth as run_antigravity_oauth,
     run_codex_browser_oauth as run_codex_oauth,
     start_claude_browser_oauth as begin_claude_oauth, BrowserOAuthAccountData, PendingOAuthStore,
 };
@@ -214,17 +215,56 @@ async fn save_oauth_browser_account(
         }
     }
 
+    // Deduplicate when logging into an email that is already tracked on the same platform
+    let incoming_email = data
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.contains('@'));
+    let matched_existing = incoming_email.and_then(|em| {
+        store.list_records().ok().and_then(|list| {
+            list.into_iter().find(|r| {
+                !r.is_demo && r.platform == platform && r.email.trim().eq_ignore_ascii_case(em)
+            })
+        })
+    });
+
+    let explicit_id = matched_existing.as_ref().map(|r| r.id.clone()).or_else(|| {
+        if platform == PlatformId::Antigravity {
+            incoming_email.map(agy_account_id_for_email)
+        } else {
+            None
+        }
+    });
+
+    let default_alias = matched_existing
+        .as_ref()
+        .map(|r| r.alias.clone())
+        .or_else(|| {
+            incoming_email
+                .and_then(|em| em.split('@').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("{} 账号", platform.display_name()));
+
     let req = AddAccountRequest {
         platform,
         alias: alias
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("{} 账号", platform.display_name())),
+            .unwrap_or(default_alias),
         email: data.email.unwrap_or_else(|| "account@local".to_string()),
-        tier: data.tier.or(tier).unwrap_or(SubscriptionTier::Paid),
+        tier: data
+            .tier
+            .or(tier)
+            .or_else(|| matched_existing.as_ref().map(|r| r.tier))
+            .unwrap_or(SubscriptionTier::Paid),
         plan_label: data
             .plan_label
             .or(plan_label)
+            .or_else(|| matched_existing.as_ref().map(|r| r.plan_label.clone()))
             .unwrap_or_else(|| default_plan_for(platform)),
         auth_method: AuthMethod::OauthToken,
         secret_input: None,
@@ -232,7 +272,8 @@ async fn save_oauth_browser_account(
         profile_id: None,
     };
 
-    let rec = store.add_account(&req, Some(&data.creds), None, None, None)?;
+    let profile_dir = matched_existing.and_then(|r| r.profile_dir);
+    let rec = store.add_account(&req, Some(&data.creds), explicit_id, profile_dir, None)?;
     let quota = registry.refresh_single(store, &rec, &ctx).await;
     emit_snapshot(app, store);
     Ok(quota)
@@ -348,8 +389,12 @@ pub async fn add_account(
                 creds.api_key = Some(raw_secret.to_string());
             }
             AuthMethod::OauthToken => {
-                creds.access_token = Some(raw_secret.to_string());
-                creds.refresh_token = req.refresh_token.clone();
+                if raw_secret.starts_with("1//") {
+                    creds.refresh_token = Some(raw_secret.to_string());
+                } else {
+                    creds.access_token = Some(raw_secret.to_string());
+                    creds.refresh_token = req.refresh_token.clone();
+                }
             }
             AuthMethod::Cookie => {
                 if req.platform == PlatformId::Claude && !raw_secret.contains('=') {
@@ -502,6 +547,50 @@ fn resolve_agy_target_id_and_alias(
     (id, alias)
 }
 
+fn record_has_isolated_refresh(store: &AccountStore, account_id: &str) -> bool {
+    let Ok(Some(rec)) = store.get_record(account_id) else {
+        return false;
+    };
+    rec.auth_method == AuthMethod::OauthToken
+        && store
+            .decrypt_credentials(&rec)
+            .ok()
+            .flatten()
+            .and_then(|c| c.refresh_token)
+            .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn upsert_discovered_agy_quota(
+    store: &AccountStore,
+    target_id: String,
+    target_alias: String,
+    email: String,
+    auth_method: AuthMethod,
+    creds: Option<&SecretCredentials>,
+    quota: &AccountQuota,
+) -> Result<(), String> {
+    if record_has_isolated_refresh(store, &target_id) {
+        if quota.status == AccountStatus::Ok {
+            let _ = store.update_cached_quota(quota);
+        }
+        return Ok(());
+    }
+    let req = AddAccountRequest {
+        platform: PlatformId::Antigravity,
+        alias: target_alias,
+        email,
+        tier: quota.tier,
+        plan_label: quota.plan_label.clone(),
+        auth_method,
+        secret_input: None,
+        refresh_token: None,
+        profile_id: None,
+    };
+    let _ = store.add_account(&req, creds, Some(target_id), None, Some(quota.clone()))?;
+    let _ = store.update_cached_quota(quota);
+    Ok(())
+}
+
 async fn detect_antigravity_local_inner(
     app: &AppHandle,
     alias: Option<String>,
@@ -611,25 +700,15 @@ async fn detect_antigravity_local_inner(
             quota.id = target_id.clone();
             quota.alias = target_alias.clone();
 
-            let req = AddAccountRequest {
-                platform: PlatformId::Antigravity,
-                alias: target_alias,
-                email: quota.email.clone(),
-                tier: quota.tier,
-                plan_label: quota.plan_label.clone(),
-                auth_method: AuthMethod::LocalServer,
-                secret_input: None,
-                refresh_token: None,
-                profile_id: None,
-            };
-            let _ = store.add_account(
-                &req,
+            upsert_discovered_agy_quota(
+                store,
+                target_id,
+                target_alias,
+                quota.email.clone(),
+                AuthMethod::LocalServer,
                 matching_cand.as_ref(),
-                Some(target_id),
-                None,
-                Some(quota.clone()),
+                &quota,
             )?;
-            let _ = store.update_cached_quota(&quota);
 
             // 若离线缓存/凭据管理器中还存有其他独立反重力账号的可用 OAuth 凭据，同步补全或刷新，避免多号切换时丢掉旧号 Token
             if alias_override.is_none() {
@@ -681,29 +760,15 @@ async fn detect_antigravity_local_inner(
                             resolve_agy_target_id_and_alias(store, &extra_email, None);
                         extra_q.id = eid.clone();
                         extra_q.alias = ealias.clone();
-                        let ereq = AddAccountRequest {
-                            platform: PlatformId::Antigravity,
-                            alias: ealias,
-                            email: extra_email,
-                            tier: extra_q.tier,
-                            plan_label: extra_q.plan_label.clone(),
-                            auth_method: AuthMethod::OauthToken,
-                            secret_input: None,
-                            refresh_token: None,
-                            profile_id: None,
-                        };
-                        if store
-                            .add_account(
-                                &ereq,
-                                Some(&cand.creds),
-                                Some(eid),
-                                None,
-                                Some(extra_q.clone()),
-                            )
-                            .is_ok()
-                        {
-                            let _ = store.update_cached_quota(&extra_q);
-                        }
+                        let _ = upsert_discovered_agy_quota(
+                            store,
+                            eid,
+                            ealias,
+                            extra_email,
+                            AuthMethod::OauthToken,
+                            Some(&cand.creds),
+                            &extra_q,
+                        );
                     }
                 }
             }
@@ -753,25 +818,15 @@ async fn detect_antigravity_local_inner(
                 quota.alias = target_alias.clone();
 
                 let source_desc = cand.source_desc.clone();
-                let req = AddAccountRequest {
-                    platform: PlatformId::Antigravity,
-                    alias: target_alias,
-                    email: final_email,
-                    tier: quota.tier,
-                    plan_label: quota.plan_label.clone(),
-                    auth_method: cand.auth_method,
-                    secret_input: None,
-                    refresh_token: None,
-                    profile_id: None,
-                };
-                let _ = store.add_account(
-                    &req,
+                upsert_discovered_agy_quota(
+                    store,
+                    target_id,
+                    target_alias,
+                    final_email,
+                    cand.auth_method,
                     Some(&cand.creds),
-                    Some(target_id),
-                    None,
-                    Some(quota.clone()),
+                    &quota,
                 )?;
-                let _ = store.update_cached_quota(&quota);
                 emit_snapshot(app, store);
                 return Ok(DetectLocalResult {
                     found: true,
@@ -808,25 +863,15 @@ async fn detect_antigravity_local_inner(
             quota.id = target_id.clone();
             quota.alias = target_alias.clone();
 
-            let req = AddAccountRequest {
-                platform: PlatformId::Antigravity,
-                alias: target_alias,
-                email: cand.email,
-                tier: cand.tier,
-                plan_label: cand.plan_label,
-                auth_method: cand.auth_method,
-                secret_input: None,
-                refresh_token: None,
-                profile_id: None,
-            };
-            let _ = store.add_account(
-                &req,
+            upsert_discovered_agy_quota(
+                store,
+                target_id,
+                target_alias,
+                cand.email,
+                cand.auth_method,
                 Some(&cand.creds),
-                Some(target_id),
-                None,
-                Some(quota.clone()),
+                &quota,
             )?;
-            let _ = store.update_cached_quota(&quota);
             emit_snapshot(app, store);
             return Ok(DetectLocalResult {
                 found: true,
@@ -1161,6 +1206,34 @@ pub async fn capture_auth_webview(
     }
 
     Ok(result)
+}
+
+#[tauri::command]
+pub async fn start_antigravity_browser_oauth(
+    app: AppHandle,
+    alias: Option<String>,
+    plan_label: Option<String>,
+    tier: Option<SubscriptionTier>,
+    rebind_account_id: Option<String>,
+    store: State<'_, Arc<AccountStore>>,
+    registry: State<'_, Arc<ProviderRegistry>>,
+    bridge: State<'_, Arc<WebviewBridgeStore>>,
+    pending_oauth: State<'_, Arc<PendingOAuthStore>>,
+) -> Result<AccountQuota, String> {
+    let data = run_antigravity_oauth(&app, &pending_oauth).await?;
+    save_oauth_browser_account(
+        &app,
+        &store,
+        &registry,
+        &bridge,
+        PlatformId::Antigravity,
+        data,
+        alias,
+        plan_label,
+        tier,
+        rebind_account_id,
+    )
+    .await
 }
 
 #[tauri::command]

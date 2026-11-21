@@ -12,6 +12,7 @@ import {
   detectOpencodeCliLocal,
   isTauriRuntime,
   openAuthWebview,
+  startAntigravityBrowserOauth,
   startClaudeBrowserOauth,
   startCodexBrowserOauth,
 } from '../api/tauriClient';
@@ -51,13 +52,14 @@ function getAuthModeOptions(platform: PlatformId): AuthModeOption[] {
   switch (platform) {
     case 'antigravity':
       return [
+        { id: 'default_browser', label: '默认浏览器登录', wireMethod: 'oauth_token' },
         { id: 'local_auto', label: '本机自动读取', wireMethod: 'local_server' },
         {
           id: 'manual_secret',
           label: '手动 Token',
           wireMethod: 'oauth_token',
-          secretLabel: 'OAuth Access Token',
-          secretPlaceholder: '粘贴 Antigravity OAuth Access Token (ya29...)',
+          secretLabel: 'Refresh / Access Token',
+          secretPlaceholder: '粘贴 1//...（永久 Refresh Token）或 ya29...（Access Token）',
         },
       ];
     case 'gemini':
@@ -366,19 +368,30 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
     const targetTier = (tierRaw as SubscriptionTier) || 'paid';
     const rebindId = rebindAccount?.id;
 
-    if (platform === 'codex') {
+    if (platform === 'antigravity' || platform === 'codex') {
       setBusy(true);
       setOauthWaiting(true);
       try {
-        const account = await startCodexBrowserOauth({
-          alias: customAlias,
-          planLabel,
-          tier: targetTier,
-          rebindAccountId: rebindId,
-        });
+        const account =
+          platform === 'antigravity'
+            ? await startAntigravityBrowserOauth({
+                alias: customAlias,
+                planLabel,
+                tier: targetTier,
+                rebindAccountId: rebindId,
+              })
+            : await startCodexBrowserOauth({
+                alias: customAlias,
+                planLabel,
+                tier: targetTier,
+                rebindAccountId: rebindId,
+              });
+        const platformTitle = platform === 'antigravity' ? '反重力' : 'Codex';
         onAdded(
           account,
-          rebindId ? `已通过默认浏览器更新 ${account.alias} 授权` : `已授权并导入 Codex · ${account.alias}`
+          rebindId
+            ? `已通过默认浏览器更新 ${account.alias} 持久授权`
+            : `已授权并导入 ${platformTitle} · ${account.alias}`
         );
       } catch (err) {
         setStatusError(err instanceof Error ? err.message : String(err));
@@ -696,6 +709,12 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                   <span>通过系统默认浏览器直接授权登录</span>
                 </div>
 
+                {platform === 'antigravity' && (
+                  <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-sub)' }}>
+                    点击下方按钮在系统默认浏览器登录 Google 账号（会自动读取本机 Antigravity 客户端配置并保存独立永久 Refresh Token）。即使在客户端切到其他账号，这里的多账号额度依然会持续自动刷新、不再 1 小时过期。
+                  </p>
+                )}
+
                 {platform === 'codex' && (
                   <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-sub)' }}>
                     点击下方按钮将在系统默认浏览器打开 OpenAI 授权页面，无需任何配置，确认登录后自动回传 OAuth Token 并同步 5h / 7d 额度。
@@ -849,10 +868,10 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => handleSelectAuthMode('manual_secret')}
+                      onClick={() => handleSelectAuthMode('default_browser')}
                       className="px-2 py-0.5 rounded-lg bg-rose-500/15 border border-rose-500/35 font-medium hover:bg-rose-500/25 transition"
                     >
-                      改用手动 Token
+                      改用默认浏览器登录（持久免重登）
                     </button>
                   </div>
                 )}

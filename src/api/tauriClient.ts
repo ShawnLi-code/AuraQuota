@@ -303,6 +303,23 @@ export async function captureAuthWebview(
   });
 }
 
+export async function startAntigravityBrowserOauth(params?: {
+  alias?: string;
+  planLabel?: string;
+  tier?: SubscriptionTier;
+  rebindAccountId?: string;
+}): Promise<AccountQuota> {
+  if (!isTauriRuntime()) {
+    throw new Error('默认浏览器 OAuth 登录仅在 Tauri 桌面端可用');
+  }
+  return invoke<AccountQuota>('start_antigravity_browser_oauth', {
+    alias: params?.alias ?? null,
+    planLabel: params?.planLabel ?? null,
+    tier: params?.tier ?? null,
+    rebindAccountId: params?.rebindAccountId ?? null,
+  });
+}
+
 export async function startCodexBrowserOauth(params?: {
   alias?: string;
   planLabel?: string;
@@ -399,7 +416,7 @@ export async function saveAppSettings(next: AppSettings): Promise<AppSettings> {
 export async function checkForUpdates(feedUrl?: string): Promise<UpdateCheckResult> {
   if (!isTauriRuntime()) {
     return {
-      currentVersion: '0.3.6',
+      currentVersion: '0.3.7',
       hasUpdate: false,
       message: '浏览器预览模式不检查更新',
       configured: false,

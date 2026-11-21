@@ -433,7 +433,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         >
           <div className="flex items-center justify-between">
             <span className="font-semibold">
-              应用更新 <span className="font-normal opacity-75">v{updateResult?.currentVersion ?? '0.3.6'}</span>
+              应用更新 <span className="font-normal opacity-75">v{updateResult?.currentVersion ?? '0.3.7'}</span>
             </span>
             <button
               type="button"

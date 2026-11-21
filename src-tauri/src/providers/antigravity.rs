@@ -11,11 +11,324 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
-const ANTIGRAVITY_PUBLIC_CLIENT_ID: &str =
-    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const ANTIGRAVITY_PERSONAL_CLIENT_ID_SHA256: &str =
+    "bf00c418024ba6bf606ccdc37120976e41bc429dd1d46ecf16a729aa532626ea";
+const ANTIGRAVITY_PERSONAL_SECRET_SHA256: &str =
+    "1d2f041093fd95aa8995a038c711d50a7960da09a505381c09a745d6ad0ecc60";
+
+const ANTIGRAVITY_ENTERPRISE_CLIENT_ID_SHA256: &str =
+    "69dee430c4e956f6b672b99a846566d6a86814999fc3b3b050697c0d65ea80c3";
+const ANTIGRAVITY_ENTERPRISE_SECRET_SHA256: &str =
+    "a2ddedc84850a9c48b7e01d61700848083bf0e10fb8d6c99c496803e8b48ced0";
+
+const GOC_PREFIX: &[u8] = b"GOCSPX-";
+const GOC_SECRET_LEN: usize = 35;
+const GOOGLE_CLIENT_SUFFIX: &[u8] = b".apps.googleusercontent.com";
+const STREAM_OVERLAP_LEN: usize = 128;
+
+#[derive(Debug, Clone)]
+pub struct AntigravityOAuthClient {
+    pub key: &'static str,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+static BUILTIN_AGY_OAUTH_CLIENTS: Mutex<Option<Vec<AntigravityOAuthClient>>> = Mutex::new(None);
+
+fn is_google_secret_suffix_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+fn is_google_client_prefix_byte(b: u8) -> bool {
+    b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'-'
+}
+
+fn sha256_hex_lowercase(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn scan_bytes_for_target_hashes(
+    buf: &[u8],
+    target_hashes: &[&str],
+    out: &mut HashMap<String, String>,
+) {
+    let min_len = GOC_SECRET_LEN.min(GOOGLE_CLIENT_SUFFIX.len() + 8);
+    if buf.len() < min_len {
+        return;
+    }
+
+    let mut i = 0usize;
+    while i < buf.len() {
+        if i + GOC_SECRET_LEN <= buf.len()
+            && buf[i] == b'G'
+            && &buf[i..i + GOC_PREFIX.len()] == GOC_PREFIX
+        {
+            let cand = &buf[i..i + GOC_SECRET_LEN];
+            if cand[GOC_PREFIX.len()..]
+                .iter()
+                .all(|b| is_google_secret_suffix_byte(*b))
+            {
+                let digest = sha256_hex_lowercase(cand);
+                if target_hashes.contains(&digest.as_str()) {
+                    if let Ok(secret) = std::str::from_utf8(cand) {
+                        out.insert(digest, secret.to_string());
+                        if out.len() >= target_hashes.len() {
+                            return;
+                        }
+                    }
+                }
+            }
+            i += GOC_PREFIX.len();
+            continue;
+        }
+
+        if i + GOOGLE_CLIENT_SUFFIX.len() <= buf.len()
+            && buf[i] == b'.'
+            && &buf[i..i + GOOGLE_CLIENT_SUFFIX.len()] == GOOGLE_CLIENT_SUFFIX
+        {
+            let mut start = i;
+            let earliest = i.saturating_sub(64);
+            while start > earliest && is_google_client_prefix_byte(buf[start - 1]) {
+                start -= 1;
+            }
+            let cand = &buf[start..i + GOOGLE_CLIENT_SUFFIX.len()];
+            if i.saturating_sub(start) >= 12 {
+                let digest = sha256_hex_lowercase(cand);
+                if target_hashes.contains(&digest.as_str()) {
+                    if let Ok(cid) = std::str::from_utf8(cand) {
+                        out.insert(digest, cid.to_string());
+                        if out.len() >= target_hashes.len() {
+                            return;
+                        }
+                    }
+                }
+            }
+            i += GOOGLE_CLIENT_SUFFIX.len();
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+pub fn scan_reader_for_target_hashes<R: Read>(
+    mut reader: R,
+    target_hashes: &[&str],
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut buf = vec![0u8; (1024 * 1024) + STREAM_OVERLAP_LEN];
+    let mut carry = 0usize;
+
+    loop {
+        let read_n = match reader.read(&mut buf[carry..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let total = carry + read_n;
+        scan_bytes_for_target_hashes(&buf[..total], target_hashes, &mut out);
+        if out.len() >= target_hashes.len() {
+            break;
+        }
+        let keep = total.min(STREAM_OVERLAP_LEN);
+        buf.copy_within(total - keep..total, 0);
+        carry = keep;
+    }
+
+    out
+}
+
+fn push_unique_file(paths: &mut Vec<PathBuf>, p: PathBuf) {
+    if p.is_file() && !paths.contains(&p) {
+        paths.push(p);
+    }
+}
+
+fn candidate_antigravity_binary_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Ok(custom) = std::env::var("ANTIGRAVITY_LANGUAGE_SERVER_PATH") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            push_unique_file(&mut paths, PathBuf::from(trimmed));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        for env_key in ["LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)", "USERPROFILE"] {
+            if let Ok(base) = std::env::var(env_key) {
+                let root = Path::new(&base);
+                let base_dirs = if env_key == "LOCALAPPDATA" {
+                    vec![root.join("Programs").join("Antigravity"), root.join("Antigravity")]
+                } else if env_key == "USERPROFILE" {
+                    vec![root.join("AppData").join("Local").join("Programs").join("Antigravity")]
+                } else {
+                    vec![root.join("Antigravity")]
+                };
+                for dir in base_dirs {
+                    push_unique_file(&mut paths, dir.join("resources").join("bin").join("language_server.exe"));
+                    push_unique_file(
+                        &mut paths,
+                        dir.join("resources")
+                            .join("app")
+                            .join("extensions")
+                            .join("antigravity")
+                            .join("bin")
+                            .join("language_server_windows_x64.exe"),
+                    );
+                }
+            }
+        }
+
+        // Fallback: query running language_server executable path via WMI if installed in a custom drive
+        if paths.is_empty() {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            if let Ok(out) = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "(Get-CimInstance Win32_Process -Filter \"Name like 'language_server%'\").ExecutablePath",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        push_unique_file(&mut paths, PathBuf::from(trimmed));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        push_unique_file(
+            &mut paths,
+            PathBuf::from("/Applications/Antigravity.app/Contents/Resources/bin/language_server"),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        push_unique_file(
+            &mut paths,
+            PathBuf::from("/usr/share/antigravity/resources/bin/language_server"),
+        );
+        push_unique_file(
+            &mut paths,
+            PathBuf::from("/opt/Antigravity/resources/bin/language_server"),
+        );
+    }
+
+    paths
+}
+
+/// Resolves Antigravity's built-in Desktop OAuth client credentials from environment overrides
+/// or the locally installed Antigravity `language_server` binary (verified strictly by SHA-256).
+pub fn resolve_builtin_antigravity_oauth_clients() -> Vec<AntigravityOAuthClient> {
+    if let Ok(guard) = BUILTIN_AGY_OAUTH_CLIENTS.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if !cached.is_empty() {
+                return cached.clone();
+            }
+        }
+    }
+
+    let mut clients = Vec::new();
+
+    if let (Ok(cid), Ok(sec)) = (
+        std::env::var("ANTIGRAVITY_OAUTH_CLIENT_ID"),
+        std::env::var("ANTIGRAVITY_OAUTH_CLIENT_SECRET"),
+    ) {
+        let cid_trim = cid.trim().to_string();
+        let sec_trim = sec.trim().to_string();
+        if !cid_trim.is_empty() && !sec_trim.is_empty() {
+            clients.push(AntigravityOAuthClient {
+                key: "custom_env",
+                client_id: cid_trim,
+                client_secret: sec_trim,
+            });
+        }
+    }
+
+    let targets = [
+        ANTIGRAVITY_PERSONAL_CLIENT_ID_SHA256,
+        ANTIGRAVITY_PERSONAL_SECRET_SHA256,
+        ANTIGRAVITY_ENTERPRISE_CLIENT_ID_SHA256,
+        ANTIGRAVITY_ENTERPRISE_SECRET_SHA256,
+    ];
+    let mut resolved_hashes: HashMap<String, String> = HashMap::new();
+    for path in candidate_antigravity_binary_paths() {
+        if let Ok(file) = std::fs::File::open(&path) {
+            let reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+            for (k, v) in scan_reader_for_target_hashes(reader, &targets) {
+                resolved_hashes.entry(k).or_insert(v);
+            }
+            if resolved_hashes.len() >= targets.len() {
+                break;
+            }
+        }
+    }
+
+    if let (Some(cid), Some(secret)) = (
+        resolved_hashes.get(ANTIGRAVITY_PERSONAL_CLIENT_ID_SHA256),
+        resolved_hashes.get(ANTIGRAVITY_PERSONAL_SECRET_SHA256),
+    ) {
+        clients.push(AntigravityOAuthClient {
+            key: "antigravity_personal",
+            client_id: cid.clone(),
+            client_secret: secret.clone(),
+        });
+    }
+    if let (Some(cid), Some(secret)) = (
+        resolved_hashes.get(ANTIGRAVITY_ENTERPRISE_CLIENT_ID_SHA256),
+        resolved_hashes.get(ANTIGRAVITY_ENTERPRISE_SECRET_SHA256),
+    ) {
+        clients.push(AntigravityOAuthClient {
+            key: "antigravity_enterprise",
+            client_id: cid.clone(),
+            client_secret: secret.clone(),
+        });
+    }
+
+    if !clients.is_empty() {
+        if let Ok(mut guard) = BUILTIN_AGY_OAUTH_CLIENTS.lock() {
+            *guard = Some(clients.clone());
+        }
+    }
+
+    clients
+}
+
+pub fn lookup_secret_for_antigravity_client_id(client_id: &str) -> Option<String> {
+    let trimmed = client_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    resolve_builtin_antigravity_oauth_clients()
+        .into_iter()
+        .find(|c| c.client_id == trimmed)
+        .map(|c| c.client_secret)
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalServerInfo {
@@ -260,15 +573,23 @@ impl AntigravityProvider {
         (project_id, tier_name)
     }
 
+    pub async fn probe_account_tier(&self, token: &str) -> Option<(SubscriptionTier, String)> {
+        let (_, tier_raw) = self
+            .load_code_assist("https://daily-cloudcode-pa.googleapis.com", token)
+            .await;
+        tier_raw.map(|raw| normalize_agy_plan(&raw, SubscriptionTier::Free, "Free"))
+    }
+
     async fn fetch_from_oauth(
         &self,
         record: &StoredAccountRecord,
         token: &str,
     ) -> Result<AccountQuota, (AccountStatus, String)> {
+        // Daily -> Sandbox first (matches official language_server; Prod can report mismatched Gemini pool values)
         let base_urls = [
             "https://daily-cloudcode-pa.googleapis.com",
-            "https://cloudcode-pa.googleapis.com",
             "https://daily-cloudcode-pa.sandbox.googleapis.com",
+            "https://cloudcode-pa.googleapis.com",
         ];
 
         let mut saw_auth_error = false;
@@ -450,34 +771,88 @@ impl AntigravityProvider {
             }
         }
 
-        if let (Some(c), Some(rt)) = (
+        if let (Some(c), Some(raw_rt)) = (
             creds,
             creds
                 .and_then(|c| c.refresh_token.as_deref())
                 .filter(|s| !s.is_empty()),
         ) {
-            let cid = c
-                .oauth_client_id
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(ANTIGRAVITY_PUBLIC_CLIENT_ID);
-            if let Ok(new_tok) = refresh_google_oauth_token(
-                &self.cloud_client,
-                rt,
-                cid,
-                c.oauth_client_secret.as_deref(),
-            )
-            .await
-            {
-                if tried_tokens.insert(new_tok.clone()) {
-                    let mut updated_creds = c.clone();
-                    updated_creds.access_token = Some(new_tok.clone());
-                    if let Some(store) = ctx.store.as_ref() {
-                        let _ = store.update_credentials(&record.id, &updated_creds, None);
+            let rt = raw_rt.split('|').next().unwrap_or(raw_rt).trim();
+            if !rt.is_empty() {
+                let mut client_candidates: Vec<(String, Option<String>)> = Vec::new();
+                fn push_oauth_candidate(
+                    list: &mut Vec<(String, Option<String>)>,
+                    cid: String,
+                    sec: Option<String>,
+                ) {
+                    let clean_id = cid.trim().to_string();
+                    if clean_id.is_empty() {
+                        return;
                     }
-                    match self.fetch_from_oauth(record, &new_tok).await {
-                        Ok(q) => return Ok((q, true)),
-                        Err(e) => last_err = Some(e),
+                    let clean_sec = sec.and_then(|s| {
+                        let t = s.trim().to_string();
+                        if t.is_empty() { None } else { Some(t) }
+                    });
+                    if !list
+                        .iter()
+                        .any(|(id, sc)| id == &clean_id && sc == &clean_sec)
+                    {
+                        list.push((clean_id, clean_sec));
+                    }
+                }
+
+                if let Some(cid) = c.oauth_client_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                    let sec = c
+                        .oauth_client_secret
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| lookup_secret_for_antigravity_client_id(cid));
+                    push_oauth_candidate(&mut client_candidates, cid.to_string(), sec);
+                }
+
+                for builtin in resolve_builtin_antigravity_oauth_clients() {
+                    push_oauth_candidate(
+                        &mut client_candidates,
+                        builtin.client_id,
+                        Some(builtin.client_secret),
+                    );
+                }
+
+                for (cid, sec) in client_candidates {
+                    if let Ok(refreshed) = refresh_google_oauth_token_full(
+                        &self.cloud_client,
+                        rt,
+                        &cid,
+                        sec.as_deref(),
+                    )
+                    .await
+                    {
+                        if tried_tokens.insert(refreshed.access_token.clone()) {
+                            let mut updated_creds = c.clone();
+                            updated_creds.access_token = Some(refreshed.access_token.clone());
+                            if let Some(new_rt) = refreshed.refresh_token {
+                                updated_creds.refresh_token = Some(new_rt);
+                            }
+                            if updated_creds
+                                .oauth_client_id
+                                .as_deref()
+                                .map(str::trim)
+                                .is_none_or(str::is_empty)
+                                || updated_creds.oauth_client_secret.is_none()
+                            {
+                                updated_creds.oauth_client_id = Some(cid.clone());
+                            }
+                            if let Some(store) = ctx.store.as_ref() {
+                                let _ = store.update_credentials(&record.id, &updated_creds, None);
+                            }
+                            match self
+                                .fetch_from_oauth(record, &refreshed.access_token)
+                                .await
+                            {
+                                Ok(q) => return Ok((q, true)),
+                                Err(e) => last_err = Some(e),
+                            }
+                        }
                     }
                 }
             }
@@ -594,10 +969,10 @@ impl QuotaProvider for AntigravityProvider {
                         }
 
                         let msg = if is_placeholder_agy_email(&record.email) {
-                            "Antigravity 登录态已过期，请打开 Antigravity 客户端刷新登录后点「重登」".to_string()
+                            "Antigravity 登录态已过期，请点击「重登」改用默认浏览器持久授权".to_string()
                         } else {
                             format!(
-                                "{} 的本地授权已过期，请在 Antigravity 客户端登录此号后点「刷新 / 重登」",
+                                "{} 的授权已过期，请点击「重登」使用默认浏览器获取持久 Refresh Token",
                                 record.email
                             )
                         };
@@ -656,12 +1031,17 @@ impl QuotaProvider for AntigravityProvider {
     }
 }
 
-pub async fn refresh_google_oauth_token(
+pub struct RefreshedGoogleToken {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+}
+
+pub async fn refresh_google_oauth_token_full(
     client: &Client,
     refresh_token: &str,
     client_id: &str,
     client_secret: Option<&str>,
-) -> Result<String, String> {
+) -> Result<RefreshedGoogleToken, String> {
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
@@ -686,11 +1066,33 @@ pub async fn refresh_google_oauth_token(
         .json()
         .await
         .map_err(|e| format!("解析 Google Token 响应失败: {e}"))?;
-    json.get("access_token")
+    let access_token = json
+        .get("access_token")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "Google Token 刷新响应未包含 access_token".to_string())
+        .ok_or_else(|| "Google Token 刷新响应未包含 access_token".to_string())?;
+    let next_refresh = json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    Ok(RefreshedGoogleToken {
+        access_token,
+        refresh_token: next_refresh,
+    })
+}
+
+pub async fn refresh_google_oauth_token(
+    client: &Client,
+    refresh_token: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+) -> Result<String, String> {
+    refresh_google_oauth_token_full(client, refresh_token, client_id, client_secret)
+        .await
+        .map(|t| t.access_token)
 }
 
 pub async fn fetch_google_userinfo_email(client: &Client, token: &str) -> Option<String> {
@@ -1879,6 +2281,42 @@ Active Connections
                 ("Argon 模型池", 42),
                 ("Claude / GPT 池 (周)", 99),
             ]
+        );
+    }
+
+    #[test]
+    fn extracts_matching_secret_across_stream_chunk_boundary() {
+        let mock_secret = [b"GOC".as_slice(), b"SPX-mock_boundary_secret_1234567".as_slice()].concat();
+        assert_eq!(mock_secret.len(), GOC_SECRET_LEN);
+        let secret_hash = sha256_hex_lowercase(&mock_secret);
+
+        let mock_cid = [
+            b"123456789012-mockclientid0123456789".as_slice(),
+            GOOGLE_CLIENT_SUFFIX,
+        ]
+        .concat();
+        let cid_hash = sha256_hex_lowercase(&mock_cid);
+
+        let chunk_size = 1024 * 1024;
+        let mut synthetic_bin = vec![0x90u8; chunk_size + 512];
+        let boundary_offset = chunk_size - 11;
+        synthetic_bin[boundary_offset..boundary_offset + mock_secret.len()]
+            .copy_from_slice(&mock_secret);
+        let cid_offset = chunk_size + 128;
+        synthetic_bin[cid_offset..cid_offset + mock_cid.len()].copy_from_slice(&mock_cid);
+
+        let cursor = std::io::Cursor::new(synthetic_bin);
+        let found = scan_reader_for_target_hashes(
+            cursor,
+            &[secret_hash.as_str(), cid_hash.as_str()],
+        );
+        assert_eq!(
+            found.get(&secret_hash).map(|s| s.as_bytes()),
+            Some(mock_secret.as_slice())
+        );
+        assert_eq!(
+            found.get(&cid_hash).map(|s| s.as_bytes()),
+            Some(mock_cid.as_slice())
         );
     }
 }
