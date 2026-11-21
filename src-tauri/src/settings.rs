@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub const DEFAULT_UPDATE_FEED_URL: &str =
+    "https://github.com/ShawnLi-code/AuraQuota/releases/latest";
+
+const LEGACY_GITHUB_API_FEED: &str =
     "https://api.github.com/repos/ShawnLi-code/AuraQuota/releases/latest";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +46,9 @@ impl SettingsStore {
         };
 
         let mut needs_write = !path.exists();
-        if settings.update_feed_url.trim().is_empty() {
+        if settings.update_feed_url.trim().is_empty()
+            || settings.update_feed_url.trim() == LEGACY_GITHUB_API_FEED
+        {
             settings.update_feed_url = DEFAULT_UPDATE_FEED_URL.to_string();
             needs_write = true;
         }

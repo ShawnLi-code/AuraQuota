@@ -275,7 +275,7 @@ async fn wait_for_oauth_callback(
 fn oauth_http_client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(15))
-        .user_agent("AuraQuota/0.3.1")
+        .user_agent("AuraQuota/0.3.2")
         .build()
         .unwrap_or_else(|_| Client::new())
 }

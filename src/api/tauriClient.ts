@@ -99,7 +99,7 @@ const BROWSER_FALLBACK_ACCOUNTS: AccountQuota[] = [
 ];
 
 const DEFAULT_GITHUB_FEED =
-  'https://api.github.com/repos/ShawnLi-code/AuraQuota/releases/latest';
+  'https://github.com/ShawnLi-code/AuraQuota/releases/latest';
 
 let browserDemoState = [...BROWSER_FALLBACK_ACCOUNTS];
 let browserSettings: AppSettings = {
@@ -368,7 +368,7 @@ export async function saveAppSettings(next: AppSettings): Promise<AppSettings> {
 export async function checkForUpdates(feedUrl?: string): Promise<UpdateCheckResult> {
   if (!isTauriRuntime()) {
     return {
-      currentVersion: '0.3.1',
+      currentVersion: '0.3.2',
       hasUpdate: false,
       message: '浏览器预览模式不检查更新',
       configured: false,

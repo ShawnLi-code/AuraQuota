@@ -427,7 +427,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         >
           <div className="flex items-center justify-between">
             <span className="font-semibold">
-              应用更新 <span className="font-normal opacity-75">v{updateResult?.currentVersion ?? '0.3.1'}</span>
+              应用更新 <span className="font-normal opacity-75">v{updateResult?.currentVersion ?? '0.3.2'}</span>
             </span>
             <button
               type="button"
@@ -472,7 +472,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 value={settings.updateFeedUrl}
                 onChange={(e) => setSettings((s) => ({ ...s, updateFeedUrl: e.target.value }))}
                 onBlur={() => void handleSaveSettings({ updateFeedUrl: settings.updateFeedUrl })}
-                placeholder="https://api.github.com/repos/ShawnLi-code/AuraQuota/releases/latest"
+                placeholder="https://github.com/ShawnLi-code/AuraQuota/releases/latest"
                 className="aura-input w-full px-2.5 py-1.5 rounded-xl text-[11px] focus:outline-none focus:border-sky-400"
               />
             </div>

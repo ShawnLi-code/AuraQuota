@@ -1,3 +1,4 @@
+use reqwest::redirect::Policy;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
@@ -7,6 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
+use url::Url;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +47,69 @@ pub fn is_newer_version(latest: &str, current: &str) -> bool {
         )
     };
     parse_ver(latest) > parse_ver(current)
+}
+
+pub fn extract_github_owner_repo(raw_url: &str) -> Option<(String, String)> {
+    let trimmed = raw_url.trim();
+    if trimmed.to_lowercase().ends_with(".json") {
+        return None;
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let segs: Vec<&str> = parsed.path_segments()?.filter(|s| !s.is_empty()).collect();
+
+    if host == "api.github.com" {
+        if segs.len() >= 3 && segs[0].eq_ignore_ascii_case("repos") {
+            return Some((segs[1].to_string(), segs[2].to_string()));
+        }
+        return None;
+    }
+
+    if host == "github.com" || host == "www.github.com" {
+        if segs.len() == 2
+            || (segs.len() >= 3 && segs[2].eq_ignore_ascii_case("releases"))
+        {
+            return Some((segs[0].to_string(), segs[1].to_string()));
+        }
+    }
+    None
+}
+
+pub fn extract_tag_from_github_location(location: &str) -> Option<(String, String)> {
+    let marker = "/releases/tag/";
+    let idx = location.find(marker)?;
+    let tail = &location[idx + marker.len()..];
+    let tag: String = tail
+        .split(['?', '#', '/'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if tag.is_empty() {
+        return None;
+    }
+    let version = tag.trim_start_matches(['v', 'V']).to_string();
+    Some((tag, version))
+}
+
+pub fn extract_exe_asset_from_expanded_assets_html(
+    html: &str,
+    owner: &str,
+    repo: &str,
+) -> Option<String> {
+    let prefix = format!("/{owner}/{repo}/releases/download/");
+    for part in html.split("href=\"") {
+        if let Some(end_idx) = part.find('"') {
+            let href = &part[..end_idx];
+            if href.contains(&prefix) && href.to_ascii_lowercase().ends_with(".exe") {
+                if href.starts_with("http://") || href.starts_with("https://") {
+                    return Some(href.to_string());
+                }
+                return Some(format!("https://github.com{href}"));
+            }
+        }
+    }
+    None
 }
 
 pub fn parse_update_manifest(json: &Value, current: &str) -> Result<UpdateCheckResult, String> {
@@ -122,7 +187,109 @@ pub fn parse_update_manifest(json: &Value, current: &str) -> Result<UpdateCheckR
         });
     }
 
-    Err("更新清单格式不受支持（需 GitHub Releases API 或 latest.json）".to_string())
+    Err("更新清单格式不受支持（需 GitHub Releases 或 latest.json）".to_string())
+}
+
+async fn check_github_without_api(
+    client: &Client,
+    owner: &str,
+    repo: &str,
+    current: &str,
+) -> Result<UpdateCheckResult, String> {
+    // 1. Try direct CDN latest.json asset (no API rate limit!)
+    let latest_json_url =
+        format!("https://github.com/{owner}/{repo}/releases/latest/download/latest.json");
+    if let Ok(resp) = client
+        .get(&latest_json_url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<Value>().await {
+                if let Ok(res) = parse_update_manifest(&json, current) {
+                    return Ok(res);
+                }
+            }
+        }
+    }
+
+    // 2. Try GitHub web /releases/latest 302 redirect (no API rate limit!)
+    let no_redirect = Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_secs(12))
+        .user_agent(format!("AuraQuota/{current}"))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    let web_latest = format!("https://github.com/{owner}/{repo}/releases/latest");
+    let last_err;
+
+    match no_redirect.get(&web_latest).send().await {
+        Ok(r) => {
+            if let Some(loc) = r.headers().get("location").and_then(|v| v.to_str().ok()) {
+                if let Some((tag, latest)) = extract_tag_from_github_location(loc) {
+                    let expanded_url =
+                        format!("https://github.com/{owner}/{repo}/releases/expanded_assets/{tag}");
+                    let exe_url = match client.get(&expanded_url).send().await {
+                        Ok(exp) if exp.status().is_success() => exp
+                            .text()
+                            .await
+                            .ok()
+                            .and_then(|html| {
+                                extract_exe_asset_from_expanded_assets_html(&html, owner, repo)
+                            }),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| {
+                        format!(
+                            "https://github.com/{owner}/{repo}/releases/download/{tag}/AuraQuota_{latest}_x64-setup.exe"
+                        )
+                    });
+
+                    let has_update = is_newer_version(&latest, current);
+                    return Ok(UpdateCheckResult {
+                        current_version: current.to_string(),
+                        latest_version: Some(latest.clone()),
+                        has_update,
+                        release_notes: None,
+                        download_url: Some(exe_url),
+                        sha256: None,
+                        message: if has_update {
+                            format!("发现新版本 v{latest}")
+                        } else {
+                            format!("当前已是最新版本 v{current}")
+                        },
+                        configured: true,
+                    });
+                }
+            }
+            last_err = format!("GitHub Releases 页面返回 HTTP {}", r.status().as_u16());
+        }
+        Err(e) => {
+            last_err = format!("连接 GitHub Releases 失败: {e}");
+        }
+    }
+
+    // 3. Final fallback to GitHub REST API if web redirect was blocked
+    let api_url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+    if let Ok(resp) = client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<Value>().await {
+                if let Ok(res) = parse_update_manifest(&json, current) {
+                    return Ok(res);
+                }
+            }
+        }
+    }
+
+    Err(last_err)
 }
 
 pub async fn check_for_updates(feed_url: &str) -> UpdateCheckResult {
@@ -137,7 +304,8 @@ pub async fn check_for_updates(feed_url: &str) -> UpdateCheckResult {
             release_notes: None,
             download_url: None,
             sha256: None,
-            message: "尚未配置更新源；请在设置中填写 GitHub Releases API、latest.json URL 或本地目录".to_string(),
+            message: "尚未配置更新源；请在设置中填写 GitHub Releases URL、latest.json 或本地目录"
+                .to_string(),
             configured: false,
         };
     }
@@ -175,6 +343,22 @@ pub async fn check_for_updates(feed_url: &str) -> UpdateCheckResult {
         .user_agent(format!("AuraQuota/{current}"))
         .build()
         .unwrap_or_else(|_| Client::new());
+
+    if let Some((owner, repo)) = extract_github_owner_repo(trimmed) {
+        return match check_github_without_api(&client, &owner, &repo, &current).await {
+            Ok(res) => res,
+            Err(err) => UpdateCheckResult {
+                current_version: current,
+                latest_version: None,
+                has_update: false,
+                release_notes: None,
+                download_url: None,
+                sha256: None,
+                message: err,
+                configured: true,
+            },
+        };
+    }
 
     let resp = match client.get(trimmed).header("Accept", "application/json").send().await {
         Ok(r) => r,
@@ -267,6 +451,27 @@ fn scan_local_installer_dir(dir: &Path, current: &str) -> Option<UpdateCheckResu
     })
 }
 
+fn escape_ps_single_quoted(raw: &str) -> String {
+    raw.replace('\'', "''")
+}
+
+pub fn build_windows_update_script(installer_path: &Path, relaunch_exe: Option<&Path>) -> String {
+    let inst = escape_ps_single_quoted(&installer_path.to_string_lossy());
+    let relaunch = relaunch_exe
+        .map(|p| escape_ps_single_quoted(&p.to_string_lossy()))
+        .unwrap_or_default();
+
+    format!(
+        "Start-Sleep -Milliseconds 1200; \
+         $proc = Start-Process -FilePath '{inst}' -ArgumentList '/S' -PassThru; \
+         if ($proc) {{ $proc.WaitForExit() }}; \
+         Start-Sleep -Milliseconds 400; \
+         $target = '{relaunch}'; \
+         if (-not $target -or -not (Test-Path $target)) {{ $target = Join-Path $env:LOCALAPPDATA 'AuraQuota\\auraquota.exe' }}; \
+         if (Test-Path $target) {{ Start-Process -FilePath $target }}"
+    )
+}
+
 pub async fn download_and_install_update(
     app: &AppHandle,
     download_url: &str,
@@ -347,13 +552,15 @@ pub async fn download_and_install_update(
         target
     };
 
-    // Launch NSIS silent installer (/S) and exit so files can be replaced cleanly
+    // Wait briefly for process exit, install silently with NSIS (/S), then relaunch upgraded app
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        std::process::Command::new(&installer_path)
-            .arg("/S")
+        let current_exe = std::env::current_exe().ok();
+        let script = build_windows_update_script(&installer_path, current_exe.as_deref());
+        std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("启动安装程序失败: {e}"))?;
@@ -384,6 +591,37 @@ mod tests {
         assert!(is_newer_version("v1.0.0", "0.9.9"));
         assert!(!is_newer_version("0.2.0", "0.2.0"));
         assert!(!is_newer_version("0.1.9", "0.2.0"));
+    }
+
+    #[test]
+    fn parses_github_owner_repo_and_redirect_tag() {
+        assert_eq!(
+            extract_github_owner_repo("https://api.github.com/repos/ShawnLi-code/AuraQuota/releases/latest"),
+            Some(("ShawnLi-code".into(), "AuraQuota".into()))
+        );
+        assert_eq!(
+            extract_github_owner_repo("https://github.com/ShawnLi-code/AuraQuota/releases/latest"),
+            Some(("ShawnLi-code".into(), "AuraQuota".into()))
+        );
+        assert_eq!(
+            extract_github_owner_repo("https://github.com/ShawnLi-code/AuraQuota/releases/latest/download/latest.json"),
+            None
+        );
+
+        assert_eq!(
+            extract_tag_from_github_location("https://github.com/ShawnLi-code/AuraQuota/releases/tag/v0.3.2"),
+            Some(("v0.3.2".into(), "0.3.2".into()))
+        );
+    }
+
+    #[test]
+    fn parses_expanded_assets_exe_link() {
+        let html = r#"<a href="/ShawnLi-code/AuraQuota/releases/download/v0.3.2/AuraQuota_0.3.2_x64-setup.exe">Setup</a>"#;
+        let url = extract_exe_asset_from_expanded_assets_html(html, "ShawnLi-code", "AuraQuota");
+        assert_eq!(
+            url.as_deref(),
+            Some("https://github.com/ShawnLi-code/AuraQuota/releases/download/v0.3.2/AuraQuota_0.3.2_x64-setup.exe")
+        );
     }
 
     #[test]

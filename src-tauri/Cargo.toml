@@ -1,6 +1,6 @@
 [package]
 name = "auraquota"
-version = "0.3.1"
+version = "0.3.2"
 description = "AuraQuota - 极简玻璃拟态多账号 AI 额度悬浮监控工具"
 authors = ["AuraQuota"]
 edition = "2021"
