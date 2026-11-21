@@ -99,19 +99,27 @@ fn scan_bytes_for_target_hashes(
             && buf[i] == b'.'
             && &buf[i..i + GOOGLE_CLIENT_SUFFIX.len()] == GOOGLE_CLIENT_SUFFIX
         {
-            let mut start = i;
-            let earliest = i.saturating_sub(64);
-            while start > earliest && is_google_client_prefix_byte(buf[start - 1]) {
-                start -= 1;
-            }
-            let cand = &buf[start..i + GOOGLE_CLIENT_SUFFIX.len()];
-            if i.saturating_sub(start) >= 12 {
-                let digest = sha256_hex_lowercase(cand);
-                if target_hashes.contains(&digest.as_str()) {
-                    if let Ok(cid) = std::str::from_utf8(cand) {
-                        out.insert(digest, cid.to_string());
-                        if out.len() >= target_hashes.len() {
-                            return;
+            // Go binaries concatenate string literals without null terminators,
+            // so test exact valid prefix lengths (32..=56) instead of greedy scanning.
+            for prefix_len in 32..=56 {
+                if i < prefix_len {
+                    break;
+                }
+                let start = i - prefix_len;
+                let prefix = &buf[start..i];
+                if prefix[0].is_ascii_digit()
+                    && prefix.contains(&b'-')
+                    && prefix.iter().all(|b| is_google_client_prefix_byte(*b))
+                {
+                    let cand = &buf[start..i + GOOGLE_CLIENT_SUFFIX.len()];
+                    let digest = sha256_hex_lowercase(cand);
+                    if target_hashes.contains(&digest.as_str()) {
+                        if let Ok(cid) = std::str::from_utf8(cand) {
+                            out.insert(digest, cid.to_string());
+                            if out.len() >= target_hashes.len() {
+                                return;
+                            }
+                            break;
                         }
                     }
                 }
@@ -2291,7 +2299,7 @@ Active Connections
         let secret_hash = sha256_hex_lowercase(&mock_secret);
 
         let mock_cid = [
-            b"123456789012-mockclientid0123456789".as_slice(),
+            b"123456789012-mockclientid012345678901234567890".as_slice(),
             GOOGLE_CLIENT_SUFFIX,
         ]
         .concat();
@@ -2302,7 +2310,9 @@ Active Connections
         let boundary_offset = chunk_size - 11;
         synthetic_bin[boundary_offset..boundary_offset + mock_secret.len()]
             .copy_from_slice(&mock_secret);
+        // Simulate packed Go binary strings where lowercase bytes immediately precede the Client ID
         let cid_offset = chunk_size + 128;
+        synthetic_bin[cid_offset - 6..cid_offset].copy_from_slice(b"foobar");
         synthetic_bin[cid_offset..cid_offset + mock_cid.len()].copy_from_slice(&mock_cid);
 
         let cursor = std::io::Cursor::new(synthetic_bin);
@@ -2317,6 +2327,19 @@ Active Connections
         assert_eq!(
             found.get(&cid_hash).map(|s| s.as_bytes()),
             Some(mock_cid.as_slice())
+        );
+    }
+
+    #[test]
+    fn resolves_local_antigravity_clients_when_installed() {
+        if candidate_antigravity_binary_paths().is_empty() {
+            return;
+        }
+        let clients = resolve_builtin_antigravity_oauth_clients();
+        assert!(
+            clients.iter().any(|c| c.key == "antigravity_personal"),
+            "expected antigravity_personal client from local binary, got {} entries",
+            clients.len()
         );
     }
 }
