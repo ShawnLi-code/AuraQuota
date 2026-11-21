@@ -49,7 +49,7 @@ impl AntigravityProvider {
         }
     }
 
-    async fn fetch_from_local_server(
+    pub async fn fetch_from_local_server(
         &self,
         record: &StoredAccountRecord,
     ) -> Result<AccountQuota, (AccountStatus, String)> {
@@ -267,6 +267,19 @@ impl AntigravityProvider {
     }
 }
 
+fn is_placeholder_agy_email(email: &str) -> bool {
+    let t = email.trim();
+    t.is_empty() || t == "local@antigravity" || t == "account@local"
+}
+
+fn email_matches_strict(record_email: &str, found_email: &str) -> bool {
+    if is_placeholder_agy_email(record_email) {
+        return true;
+    }
+    !is_placeholder_agy_email(found_email)
+        && record_email.trim().eq_ignore_ascii_case(found_email.trim())
+}
+
 #[async_trait]
 impl QuotaProvider for AntigravityProvider {
     fn platform(&self) -> PlatformId {
@@ -327,16 +340,21 @@ impl QuotaProvider for AntigravityProvider {
                                 }
                             }
 
-                            // 2. For the auto-discovered local account, try live server and other offline candidates
+                            // 2. For auto-discovered local accounts, only renew from local server / offline cache if email matches
                             if record.id.starts_with("agy-local") {
                                 if let Ok(q) = self.fetch_from_local_server(record).await {
-                                    return q;
+                                    if email_matches_strict(&record.email, &q.email) {
+                                        return q;
+                                    }
                                 }
                                 if let Ok(Ok(candidates)) =
                                     tokio::task::spawn_blocking(discover_antigravity_offline_candidates)
                                         .await
                                 {
                                     for cand in candidates {
+                                        if !email_matches_strict(&record.email, &cand.email) {
+                                            continue;
+                                        }
                                         let Some(new_tok) = cand.creds.access_token.as_deref() else {
                                             continue;
                                         };
@@ -346,8 +364,7 @@ impl QuotaProvider for AntigravityProvider {
                                         if let Ok(mut q) =
                                             self.fetch_from_oauth(record, new_tok).await
                                         {
-                                            if q.email == "local@antigravity" || q.email.is_empty()
-                                            {
+                                            if is_placeholder_agy_email(&q.email) {
                                                 q.email = cand.email;
                                             }
                                             if let Some(store) = ctx.store.as_ref() {
@@ -363,11 +380,15 @@ impl QuotaProvider for AntigravityProvider {
                                 }
                             }
 
-                            return make_error_quota(
-                                record,
-                                AccountStatus::AuthRequired,
-                                "Antigravity OAuth Token 已过期，请点击「重登」或打开 Antigravity 刷新登录态",
-                            );
+                            let msg = if is_placeholder_agy_email(&record.email) {
+                                "Antigravity 登录态已过期，请打开 Antigravity 客户端刷新登录后点「重登」".to_string()
+                            } else {
+                                format!(
+                                    "{} 的本地授权已过期，请在 Antigravity 客户端登录此号后点「刷新 / 重登」",
+                                    record.email
+                                )
+                            };
+                            return make_error_quota(record, AccountStatus::AuthRequired, msg);
                         }
                         Err((st, msg)) => return make_error_quota(record, st, msg),
                     }
@@ -379,22 +400,42 @@ impl QuotaProvider for AntigravityProvider {
                 )
             }
             _ => {
-                // 1. Try running language_server first
+                // 1. Try running language_server first (only accept if email matches when record already has an email)
                 match self.fetch_from_local_server(record).await {
-                    Ok(q) => q,
-                    Err((_st, local_err)) => {
-                        // 2. Fallback to offline state.vscdb / ~/.gemini/oauth_creds.json candidates
+                    Ok(q) if email_matches_strict(&record.email, &q.email) => q,
+                    other_res => {
+                        let mismatch_email = match &other_res {
+                            Ok(q) => Some(q.email.clone()),
+                            Err(_) => None,
+                        };
+                        let local_err = match other_res {
+                            Ok(q) => format!("本机当前登录为 {}，请切回 {}", q.email, record.email),
+                            Err((_, e)) => e,
+                        };
+
+                        // 2. Fallback to stored credentials if attached, then matching offline candidates
+                        if let Some(tok) = creds
+                            .and_then(|c| c.access_token.as_deref())
+                            .filter(|s| !s.is_empty())
+                        {
+                            if let Ok(q) = self.fetch_from_oauth(record, tok).await {
+                                return q;
+                            }
+                        }
+
                         if let Ok(Ok(candidates)) =
                             tokio::task::spawn_blocking(discover_antigravity_offline_candidates)
                                 .await
                         {
                             let mut last_oauth_err: Option<(AccountStatus, String)> = None;
                             for cand in candidates {
+                                if !email_matches_strict(&record.email, &cand.email) {
+                                    continue;
+                                }
                                 if let Some(tok) = cand.creds.access_token.as_deref() {
                                     match self.fetch_from_oauth(record, tok).await {
                                         Ok(mut q) => {
-                                            if q.email == "local@antigravity" || q.email.is_empty()
-                                            {
+                                            if is_placeholder_agy_email(&q.email) {
                                                 q.email = cand.email;
                                             }
                                             q.status_message =
@@ -418,7 +459,12 @@ impl QuotaProvider for AntigravityProvider {
                                 return make_error_quota(record, st, oauth_err);
                             }
                         }
-                        make_error_quota(record, AccountStatus::Offline, local_err)
+                        let status = if mismatch_email.is_some() {
+                            AccountStatus::AuthRequired
+                        } else {
+                            AccountStatus::Offline
+                        };
+                        make_error_quota(record, status, local_err)
                     }
                 }
             }
@@ -924,6 +970,9 @@ pub fn parse_antigravity_quota(
 
     let detected_email = json
         .pointer("/userStatus/email")
+        .or_else(|| json.pointer("/userStatus/user/email"))
+        .or_else(|| json.pointer("/user/email"))
+        .or_else(|| json.pointer("/account/email"))
         .or_else(|| json.get("email"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())

@@ -17,7 +17,7 @@ use crate::oauth_browser::{
     start_claude_browser_oauth as begin_claude_oauth, BrowserOAuthAccountData, PendingOAuthStore,
 };
 use crate::poller::AlertTracker;
-use crate::providers::antigravity::discover_local_language_servers;
+use crate::providers::antigravity::{discover_local_language_servers, AntigravityProvider};
 use crate::providers::{now_hh_mm, parse_scraped_payload, ProviderContext, ProviderRegistry};
 use crate::settings::{AppSettings, SettingsStore, DEFAULT_UPDATE_FEED_URL};
 use crate::storage::AccountStore;
@@ -379,67 +379,154 @@ pub async fn restore_demo_accounts(
     })
 }
 
-#[tauri::command]
-pub async fn detect_antigravity_local(
-    app: AppHandle,
-    alias: Option<String>,
-    store: State<'_, Arc<AccountStore>>,
-    registry: State<'_, Arc<ProviderRegistry>>,
-    bridge: State<'_, Arc<WebviewBridgeStore>>,
-) -> Result<DetectLocalResult, String> {
-    let custom_alias = alias
-        .as_deref()
+fn agy_account_id_for_email(email: &str) -> String {
+    let clean = email.trim().to_lowercase();
+    if clean.is_empty() || clean == "local@antigravity" || clean == "account@local" {
+        return "agy-local".to_string();
+    }
+    let slug: String = clean
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("agy-local-{slug}")
+}
+
+fn resolve_agy_target_id_and_alias(
+    store: &AccountStore,
+    detected_email: &str,
+    alias_override: Option<&str>,
+) -> (String, String) {
+    let clean = detected_email.trim();
+    let has_real_email =
+        !clean.is_empty() && clean != "local@antigravity" && clean != "account@local";
+
+    let existing_records = store.list_records().unwrap_or_default();
+    let matched_existing = if has_real_email {
+        existing_records.iter().find(|r| {
+            r.platform == PlatformId::Antigravity && r.email.trim().eq_ignore_ascii_case(clean)
+        })
+    } else {
+        existing_records
+            .iter()
+            .find(|r| r.platform == PlatformId::Antigravity && r.id == "agy-local")
+    };
+
+    let id = matched_existing
+        .map(|r| r.id.clone())
+        .unwrap_or_else(|| agy_account_id_for_email(clean));
+
+    let alias = alias_override
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| "本机反重力".to_string());
-    let ctx = build_ctx(&app, &bridge, &store);
+        .or_else(|| matched_existing.map(|r| r.alias.clone()))
+        .unwrap_or_else(|| {
+            if has_real_email {
+                let prefix = clean.split('@').next().unwrap_or("反重力");
+                format!("反重力 · {prefix}")
+            } else {
+                "本机反重力".to_string()
+            }
+        });
+
+    if has_real_email && id != "agy-local" {
+        if let Some(legacy) = existing_records.iter().find(|r| r.id == "agy-local") {
+            let legacy_email = legacy.email.trim();
+            if legacy_email.is_empty()
+                || legacy_email == "local@antigravity"
+                || legacy_email == "account@local"
+            {
+                let _ = store.remove_account("agy-local");
+            }
+        }
+    }
+
+    (id, alias)
+}
+
+async fn detect_antigravity_local_inner(
+    app: &AppHandle,
+    alias: Option<String>,
+    persist_expired: bool,
+    store: &Arc<AccountStore>,
+    registry: &ProviderRegistry,
+    bridge: &Arc<WebviewBridgeStore>,
+) -> Result<DetectLocalResult, String> {
+    let alias_override = alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let ctx = build_ctx(app, bridge, store);
     let agy_provider = registry
         .provider_for(PlatformId::Antigravity)
         .ok_or_else(|| "未找到反重力适配器".to_string())?;
 
-    // Remove legacy duplicate IDs before saving unified "agy-local"
     let _ = store.remove_account("agy-local-server");
     let _ = store.remove_account("agy-local-offline");
 
-    // 1. Probe live language_server in-memory first (do NOT persist failed attempts)
+    let (offline_candidates, offline_err) =
+        match tokio::task::spawn_blocking(discover_antigravity_offline_candidates)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Ok(list) => (list, None),
+            Err(msg) => (Vec::new(), Some(msg)),
+        };
+
+    // 1. Probe running Antigravity language_server directly first
     if let Ok(Ok(servers)) = tokio::task::spawn_blocking(discover_local_language_servers).await {
         let first = &servers[0];
-        let req = AddAccountRequest {
+        let probe_rec = StoredAccountRecord {
+            id: "agy-local-probe".to_string(),
             platform: PlatformId::Antigravity,
-            alias: custom_alias.clone(),
+            alias: "本机反重力".to_string(),
             email: "local@antigravity".to_string(),
             tier: SubscriptionTier::Paid,
             plan_label: "AI Pro".to_string(),
             auth_method: AuthMethod::LocalServer,
-            secret_input: None,
-            refresh_token: None,
-            profile_id: None,
-        };
-        let probe_rec = StoredAccountRecord {
-            id: "agy-local".to_string(),
-            platform: req.platform,
-            alias: req.alias.clone(),
-            email: req.email.clone(),
-            tier: req.tier,
-            plan_label: req.plan_label.clone(),
-            auth_method: req.auth_method,
             profile_dir: None,
             is_demo: false,
             encrypted_secret: None,
             cached_quota: None,
         };
-        let quota = agy_provider.fetch_quota(&probe_rec, None, &ctx).await;
-        if quota.status == AccountStatus::Ok {
+        let direct = AntigravityProvider::new();
+        if let Ok(mut quota) = direct.fetch_from_local_server(&probe_rec).await {
+            let matching_cand = offline_candidates.iter().find(|c| {
+                c.email != "local@antigravity"
+                    && quota.email != "local@antigravity"
+                    && c.email.eq_ignore_ascii_case(&quota.email)
+            });
+            if (quota.email.is_empty() || quota.email == "local@antigravity")
+                && offline_candidates.len() == 1
+            {
+                quota.email = offline_candidates[0].email.clone();
+            }
+            let (target_id, target_alias) =
+                resolve_agy_target_id_and_alias(store, &quota.email, alias_override.as_deref());
+            quota.id = target_id.clone();
+            quota.alias = target_alias.clone();
+
+            let req = AddAccountRequest {
+                platform: PlatformId::Antigravity,
+                alias: target_alias,
+                email: quota.email.clone(),
+                tier: quota.tier,
+                plan_label: quota.plan_label.clone(),
+                auth_method: AuthMethod::LocalServer,
+                secret_input: None,
+                refresh_token: None,
+                profile_id: None,
+            };
             let _ = store.add_account(
                 &req,
-                None,
-                Some("agy-local".to_string()),
+                matching_cand.map(|c| &c.creds),
+                Some(target_id),
                 None,
                 Some(quota.clone()),
             )?;
             let _ = store.update_cached_quota(&quota);
-            emit_snapshot(&app, &store);
+            emit_snapshot(app, store);
             return Ok(DetectLocalResult {
                 found: true,
                 message: format!(
@@ -451,73 +538,45 @@ pub async fn detect_antigravity_local(
         }
     }
 
-    // 2. Fallback to offline state.vscdb / ~/.gemini/* candidates and try each before failing
-    match tokio::task::spawn_blocking(discover_antigravity_offline_candidates)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        Ok(candidates) => {
-            let mut fallback: Option<(LocalDiscoveredCredential, AccountQuota)> = None;
-            for cand in candidates {
-                let probe_rec = StoredAccountRecord {
-                    id: "agy-local".to_string(),
-                    platform: PlatformId::Antigravity,
-                    alias: custom_alias.clone(),
-                    email: cand.email.clone(),
-                    tier: cand.tier,
-                    plan_label: cand.plan_label.clone(),
-                    auth_method: cand.auth_method,
-                    profile_dir: None,
-                    is_demo: false,
-                    encrypted_secret: None,
-                    cached_quota: None,
+    // 2. Fallback to offline state.vscdb / Windows 凭据管理器 / ~/.gemini/* candidates
+    if !offline_candidates.is_empty() {
+        let mut fallback: Option<(LocalDiscoveredCredential, AccountQuota)> = None;
+        for cand in offline_candidates {
+            let probe_rec = StoredAccountRecord {
+                id: "agy-local-probe".to_string(),
+                platform: PlatformId::Antigravity,
+                alias: cand.alias.clone(),
+                email: cand.email.clone(),
+                tier: cand.tier,
+                plan_label: cand.plan_label.clone(),
+                auth_method: cand.auth_method,
+                profile_dir: None,
+                is_demo: false,
+                encrypted_secret: None,
+                cached_quota: None,
+            };
+            let mut quota = agy_provider
+                .fetch_quota(&probe_rec, Some(&cand.creds), &ctx)
+                .await;
+            if quota.status == AccountStatus::Ok {
+                let final_email = if quota.email.is_empty() || quota.email == "local@antigravity" {
+                    cand.email.clone()
+                } else {
+                    quota.email.clone()
                 };
-                let quota = agy_provider
-                    .fetch_quota(&probe_rec, Some(&cand.creds), &ctx)
-                    .await;
-                if quota.status == AccountStatus::Ok {
-                    let source_desc = cand.source_desc.clone();
-                    let req = AddAccountRequest {
-                        platform: PlatformId::Antigravity,
-                        alias: custom_alias.clone(),
-                        email: quota.email.clone(),
-                        tier: quota.tier,
-                        plan_label: quota.plan_label.clone(),
-                        auth_method: cand.auth_method,
-                        secret_input: None,
-                        refresh_token: None,
-                        profile_id: None,
-                    };
-                    let _ = store.add_account(
-                        &req,
-                        Some(&cand.creds),
-                        Some("agy-local".to_string()),
-                        None,
-                        Some(quota.clone()),
-                    )?;
-                    let _ = store.update_cached_quota(&quota);
-                    emit_snapshot(&app, &store);
-                    return Ok(DetectLocalResult {
-                        found: true,
-                        message: format!(
-                            "已同步本机反重力（{source_desc} · 剩余 {}%）",
-                            quota.primary_pct
-                        ),
-                        account: Some(quota),
-                    });
-                }
-                if fallback.is_none() {
-                    fallback = Some((cand, quota));
-                }
-            }
+                quota.email = final_email.clone();
+                let (target_id, target_alias) =
+                    resolve_agy_target_id_and_alias(store, &final_email, alias_override.as_deref());
+                quota.id = target_id.clone();
+                quota.alias = target_alias.clone();
 
-            if let Some((cand, quota)) = fallback {
+                let source_desc = cand.source_desc.clone();
                 let req = AddAccountRequest {
                     platform: PlatformId::Antigravity,
-                    alias: custom_alias,
-                    email: cand.email,
-                    tier: cand.tier,
-                    plan_label: cand.plan_label,
+                    alias: target_alias,
+                    email: final_email,
+                    tier: quota.tier,
+                    plan_label: quota.plan_label.clone(),
                     auth_method: cand.auth_method,
                     secret_input: None,
                     refresh_token: None,
@@ -526,34 +585,94 @@ pub async fn detect_antigravity_local(
                 let _ = store.add_account(
                     &req,
                     Some(&cand.creds),
-                    Some("agy-local".to_string()),
+                    Some(target_id),
                     None,
                     Some(quota.clone()),
                 )?;
                 let _ = store.update_cached_quota(&quota);
-                emit_snapshot(&app, &store);
-                let msg = quota.status_message.clone().unwrap_or_else(|| {
-                    format!("已找到 {}，但同步失败", cand.source_desc)
-                });
+                emit_snapshot(app, store);
                 return Ok(DetectLocalResult {
                     found: true,
-                    message: msg,
+                    message: format!(
+                        "已同步本机反重力（{source_desc} · 剩余 {}%）",
+                        quota.primary_pct
+                    ),
                     account: Some(quota),
                 });
             }
-
-            Ok(DetectLocalResult {
-                found: false,
-                message: "未在本机检测到可用的 Antigravity 登录凭证".to_string(),
-                account: None,
-            })
+            if fallback.is_none() {
+                fallback = Some((cand, quota));
+            }
         }
-        Err(msg) => Ok(DetectLocalResult {
-            found: false,
-            message: msg,
-            account: None,
-        }),
+
+        if let Some((cand, mut quota)) = fallback {
+            let msg = quota.status_message.clone().unwrap_or_else(|| {
+                format!(
+                    "已发现离线缓存（{}），但登录态已过期；请打开 Antigravity 桌面客户端 / IDE 登录后重试",
+                    cand.source_desc
+                )
+            });
+
+            if !persist_expired {
+                return Ok(DetectLocalResult {
+                    found: false,
+                    message: msg,
+                    account: None,
+                });
+            }
+
+            let (target_id, target_alias) =
+                resolve_agy_target_id_and_alias(store, &cand.email, alias_override.as_deref());
+            quota.id = target_id.clone();
+            quota.alias = target_alias.clone();
+
+            let req = AddAccountRequest {
+                platform: PlatformId::Antigravity,
+                alias: target_alias,
+                email: cand.email,
+                tier: cand.tier,
+                plan_label: cand.plan_label,
+                auth_method: cand.auth_method,
+                secret_input: None,
+                refresh_token: None,
+                profile_id: None,
+            };
+            let _ = store.add_account(
+                &req,
+                Some(&cand.creds),
+                Some(target_id),
+                None,
+                Some(quota.clone()),
+            )?;
+            let _ = store.update_cached_quota(&quota);
+            emit_snapshot(app, store);
+            return Ok(DetectLocalResult {
+                found: true,
+                message: msg,
+                account: Some(quota),
+            });
+        }
     }
+
+    Ok(DetectLocalResult {
+        found: false,
+        message: offline_err.unwrap_or_else(|| {
+            "未在本机检测到可用的 Antigravity 登录态，请先打开 Antigravity 客户端 / IDE 登录"
+                .to_string()
+        }),
+        account: None,
+    })
+}
+
+#[tauri::command]
+pub async fn detect_antigravity_local(
+    app: AppHandle,
+    alias: Option<String>,
+    store: State<'_, Arc<AccountStore>>,
+    registry: State<'_, Arc<ProviderRegistry>>,
+    bridge: State<'_, Arc<WebviewBridgeStore>>,
+) -> Result<DetectLocalResult, String> {
+    detect_antigravity_local_inner(&app, alias, false, &store, &registry, &bridge).await
 }
 
 #[tauri::command]
@@ -711,14 +830,8 @@ pub async fn scan_local_accounts(
     registry: State<'_, Arc<ProviderRegistry>>,
     bridge: State<'_, Arc<WebviewBridgeStore>>,
 ) -> Result<ScanLocalSummary, String> {
-    let agy = detect_antigravity_local(
-        app.clone(),
-        None,
-        store.clone(),
-        registry.clone(),
-        bridge.clone(),
-    )
-    .await?;
+    let agy =
+        detect_antigravity_local_inner(&app, None, true, &store, &registry, &bridge).await?;
     let claude = detect_claude_cli_local(
         app.clone(),
         None,
@@ -1045,4 +1158,19 @@ pub async fn install_update(
     sha256: Option<String>,
 ) -> Result<(), String> {
     download_and_install_update(&app, &download_url, sha256.as_deref()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generates_distinct_non_overwriting_agy_ids_per_email() {
+        let id_a = agy_account_id_for_email("alice@example.com");
+        let id_b = agy_account_id_for_email("bob@example.com");
+        assert_ne!(id_a, id_b);
+        assert!(id_a.starts_with("agy-local-"));
+        assert!(id_b.starts_with("agy-local-"));
+        assert_eq!(agy_account_id_for_email("local@antigravity"), "agy-local");
+    }
 }

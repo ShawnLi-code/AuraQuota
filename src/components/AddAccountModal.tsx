@@ -659,11 +659,27 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
               >
                 <div className="flex items-center gap-1.5 font-medium" style={{ color: 'var(--pct-high)' }}>
                   <Laptop className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>自动读取本机已登录账号</span>
+                  <span>
+                    {platform === 'antigravity'
+                      ? '本机官方态自动读取（按邮箱多号不覆盖）'
+                      : '自动读取本机已登录账号'}
+                  </span>
                 </div>
-                <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-sub)' }}>
-                  {meta.hint}
-                </p>
+                {platform === 'antigravity' ? (
+                  <div className="text-[11px] leading-relaxed space-y-1" style={{ color: 'var(--text-sub)' }}>
+                    <p>
+                      <strong className="font-medium" style={{ color: 'var(--text-main)' }}>官方态怎么登录：</strong>
+                      打开 Antigravity 桌面客户端 / IDE 在账号头像处登录 Google，或在终端运行 <code className="px-1 rounded bg-black/15">agy</code> 完成登录即可。
+                    </p>
+                    <p>
+                      切换不同 Google 账号后再点读取会按邮箱新建独立卡片（互不覆盖）；如读取不到或已过期，可先打开客户端刷新或切换「手动 Token」。
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-sub)' }}>
+                    {meta.hint}
+                  </p>
+                )}
               </div>
             )}
 
@@ -826,9 +842,20 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
             {statusError && (
               <div
                 role="alert"
-                className="p-2 rounded-xl bg-rose-500/15 border border-rose-500/35 text-rose-500 text-[11px]"
+                className="p-2 rounded-xl bg-rose-500/15 border border-rose-500/35 text-rose-500 text-[11px] space-y-1.5"
               >
-                {statusError}
+                <p>{statusError}</p>
+                {platform === 'antigravity' && activeMode.id === 'local_auto' && (
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleSelectAuthMode('manual_secret')}
+                      className="px-2 py-0.5 rounded-lg bg-rose-500/15 border border-rose-500/35 font-medium hover:bg-rose-500/25 transition"
+                    >
+                      改用手动 Token
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

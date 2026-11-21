@@ -1,6 +1,6 @@
 [package]
 name = "auraquota"
-version = "0.3.0"
+version = "0.3.1"
 description = "AuraQuota - 极简玻璃拟态多账号 AI 额度悬浮监控工具"
 authors = ["AuraQuota"]
 edition = "2021"
@@ -34,6 +34,7 @@ sha2 = "0.10"
 window-vibrancy = "0.6"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_System_Memory",
     "Win32_Graphics_Dwm",

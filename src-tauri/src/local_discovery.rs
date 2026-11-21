@@ -1,5 +1,5 @@
 use crate::models::{AuthMethod, PlatformId, SecretCredentials, SubscriptionTier};
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -140,6 +140,25 @@ fn collect_fragments_from_value(
                 }
             }
         }
+
+        // Also scan embedded ASCII base64 runs inside binary protobuf / mixed text
+        if out.access_token.is_none() || out.refresh_token.is_none() {
+            for run in raw.split(|c: char| {
+                !c.is_ascii_alphanumeric() && !matches!(c, '+' | '/' | '=' | '-' | '_')
+            }) {
+                if run.len() >= 32
+                    && run.len() < raw.len()
+                    && !run.starts_with("ya29.")
+                    && !run.starts_with("1//")
+                {
+                    if let Some(decoded) = decode_b64_to_utf8(run) {
+                        if &decoded != run {
+                            collect_fragments_from_value(&decoded, depth + 1, out);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -226,9 +245,136 @@ fn collect_fragments_from_json(json: &Value, depth: u8, out: &mut ExtractedFragm
 fn decode_b64_to_utf8(cleaned: &str) -> Option<String> {
     let decoded = STANDARD
         .decode(cleaned)
+        .or_else(|_| STANDARD_NO_PAD.decode(cleaned))
         .or_else(|_| URL_SAFE_NO_PAD.decode(cleaned))
+        .or_else(|_| URL_SAFE.decode(cleaned))
         .ok()?;
     Some(String::from_utf8_lossy(&decoded).into_owned())
+}
+
+pub fn decode_credential_blob(bytes: &[u8]) -> Option<AntigravityExtractedAuth> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let utf8_text = String::from_utf8_lossy(bytes).trim_matches('\0').to_string();
+    let mut frag = ExtractedFragments::default();
+    collect_fragments_from_value(&utf8_text, 0, &mut frag);
+
+    if (frag.access_token.is_none() || frag.email.is_none()) && bytes.len() >= 4 && bytes.len() % 2 == 0
+    {
+        let looks_utf16le = bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .take(8)
+            .filter(|b| **b == 0)
+            .count()
+            >= 2;
+        if looks_utf16le {
+            let u16s: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let utf16_text = String::from_utf16_lossy(&u16s).trim_matches('\0').to_string();
+            collect_fragments_from_value(&utf16_text, 0, &mut frag);
+        }
+    }
+
+    frag.access_token.map(|tok| AntigravityExtractedAuth {
+        access_token: tok,
+        refresh_token: frag.refresh_token,
+        email: frag.email,
+    })
+}
+
+#[cfg(windows)]
+fn discover_windows_credential_manager_antigravity() -> Vec<LocalDiscoveredCredential> {
+    use windows_sys::Win32::Security::Credentials::{
+        CredEnumerateW, CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
+    };
+
+    let mut out = Vec::new();
+    let to_wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+
+    let mut push_cred_ptr = |cred: &CREDENTIALW, label_prefix: &str| {
+        if cred.CredentialBlob.is_null() || cred.CredentialBlobSize == 0 {
+            return;
+        }
+        let blob = unsafe {
+            std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize)
+        };
+        if let Some(auth) = decode_credential_blob(blob) {
+            let email = auth
+                .email
+                .unwrap_or_else(|| "local@antigravity".to_string());
+            push_unique_agy_candidate(
+                &mut out,
+                LocalDiscoveredCredential {
+                    platform: PlatformId::Antigravity,
+                    alias: "本机反重力".to_string(),
+                    email,
+                    plan_label: "AI Pro".to_string(),
+                    tier: SubscriptionTier::Paid,
+                    auth_method: AuthMethod::OauthToken,
+                    creds: SecretCredentials {
+                        access_token: Some(auth.access_token),
+                        refresh_token: auth.refresh_token,
+                        ..Default::default()
+                    },
+                    source_desc: label_prefix.to_string(),
+                },
+            );
+        }
+    };
+
+    for filter in ["*antigravity*", "*gemini*"] {
+        let wide_filter = to_wide(filter);
+        let mut count: u32 = 0;
+        let mut creds_ptr: *mut *mut CREDENTIALW = std::ptr::null_mut();
+        let ok = unsafe {
+            CredEnumerateW(wide_filter.as_ptr(), 0, &mut count, &mut creds_ptr)
+        };
+        if ok != 0 && !creds_ptr.is_null() {
+            let slice = unsafe { std::slice::from_raw_parts(creds_ptr, count as usize) };
+            for &ptr in slice {
+                if !ptr.is_null() {
+                    let cred = unsafe { &*ptr };
+                    push_cred_ptr(cred, "Windows 凭据管理器");
+                }
+            }
+            unsafe {
+                CredFree(creds_ptr as _);
+            }
+        }
+    }
+
+    for target in [
+        "gemini:antigravity",
+        "LegacyGeneric:target=gemini:antigravity",
+        "antigravity",
+        "Antigravity",
+    ] {
+        let wide_target = to_wide(target);
+        let mut cred_ptr: *mut CREDENTIALW = std::ptr::null_mut();
+        let ok = unsafe {
+            CredReadW(wide_target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut cred_ptr)
+        };
+        if ok != 0 && !cred_ptr.is_null() {
+            let cred = unsafe { &*cred_ptr };
+            push_cred_ptr(cred, &format!("Windows 凭据管理器 ({target})"));
+            unsafe {
+                CredFree(cred_ptr as _);
+            }
+        }
+    }
+
+    out
+}
+
+#[cfg(not(windows))]
+fn discover_windows_credential_manager_antigravity() -> Vec<LocalDiscoveredCredential> {
+    Vec::new()
 }
 
 pub fn extract_antigravity_candidates_from_rows(
@@ -446,8 +592,12 @@ pub fn discover_antigravity_offline_candidates() -> Result<Vec<LocalDiscoveredCr
         }
     }
 
+    for cred in discover_windows_credential_manager_antigravity() {
+        push_unique_agy_candidate(&mut results, cred);
+    }
+
     if results.is_empty() {
-        Err("未在本机检测到运行中的 language_server 或离线登录状态（state.vscdb / oauth_creds.json）".to_string())
+        Err("未在本机检测到 Antigravity 客户端登录态（请先打开 Antigravity 桌面客户端 / IDE 或运行 agy 登录 Google 账号）".to_string())
     } else {
         Ok(results)
     }
@@ -841,6 +991,30 @@ mod tests {
             Some("1//mock_refresh_token_abcdefghijklmnopqrstuvwxyz")
         );
         assert_eq!(cands[0].email.as_deref(), Some("agy.nested@example.com"));
+    }
+
+    #[test]
+    fn decodes_windows_credential_manager_utf8_and_utf16_blobs() {
+        let json_utf8 = br#"{"email":"cred.user@example.com","access_token":"ya29.mock_credmgr_token_abcdefghij12345","refresh_token":"1//mock_credmgr_refresh_abcdefghij"}"#;
+        let parsed = decode_credential_blob(json_utf8).expect("utf8 cred blob");
+        assert_eq!(parsed.access_token, "ya29.mock_credmgr_token_abcdefghij12345");
+        assert_eq!(parsed.email.as_deref(), Some("cred.user@example.com"));
+
+        let text = "ya29.mock_utf16_credmgr_token_99887766";
+        let utf16_bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let parsed_16 = decode_credential_blob(&utf16_bytes).expect("utf16 cred blob");
+        assert_eq!(parsed_16.access_token, text);
+    }
+
+    #[test]
+    fn extracts_unpadded_base64_and_embedded_protobuf_chunks() {
+        let inner_unpadded = STANDARD_NO_PAD.encode(br#"ya29.mock_unpadded_proto_token_1234567890"#);
+        let pseudo_proto = format!("\u{0008}\u{0012}*{inner_unpadded}\u{001a}\u{0010}proto@example.com");
+        let rows = vec![("jetskiStateSync.agentManagerInitState".to_string(), pseudo_proto)];
+        let cands = extract_antigravity_candidates_from_rows(&rows);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].access_token, "ya29.mock_unpadded_proto_token_1234567890");
+        assert_eq!(cands[0].email.as_deref(), Some("proto@example.com"));
     }
 
     #[test]
