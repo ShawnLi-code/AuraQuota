@@ -47,9 +47,13 @@ pub fn compute_account_cooldown_secs(
         return if is_focused { base } else { base.max(120) };
     }
 
-    // Cloud API / OAuth endpoints allow rapid focused updates while sparing background slots
+    // Cloud API / OAuth endpoints allow rapid focused updates while sparing background slots.
+    // Multi-account Antigravity OAuth slots stay on a 20s cadence so usage drops on secondary
+    // accounts can promote the active account card without waiting 3 minutes.
     if is_focused {
         base.max(10)
+    } else if platform == PlatformId::Antigravity && auth_method == AuthMethod::OauthToken {
+        base.max(20)
     } else {
         base.max(180)
     }
@@ -218,7 +222,19 @@ mod tests {
             60
         );
 
-        // Unfocused cloud accounts slow down to >= 180s
+        // Unfocused Antigravity OAuth accounts stay on 20s cadence for multi-account drop pinning
+        assert_eq!(
+            compute_account_cooldown_secs(
+                15,
+                false,
+                PlatformId::Antigravity,
+                AuthMethod::OauthToken,
+                Some(AccountStatus::Ok)
+            ),
+            20
+        );
+
+        // Unfocused other cloud accounts slow down to >= 180s
         assert_eq!(
             compute_account_cooldown_secs(
                 15,

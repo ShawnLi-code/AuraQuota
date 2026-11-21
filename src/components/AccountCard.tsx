@@ -48,7 +48,9 @@ function maskEmail(email: string, privacy: boolean): string {
 function compactPoolLabel(name: string): string {
   if (name.includes('Gemini 模型池 (5h)')) return 'Gem 5h';
   if (name.includes('Gemini 模型池 (周)')) return 'Gem 周';
-  if (name.includes('Argon 模型池')) return name.replace(' 模型池', '');
+  if (name.includes('Argon 模型池 (5h)')) return 'Argon 5h';
+  if (name.includes('Argon 模型池 (周)')) return 'Argon 周';
+  if (name.includes('Argon 模型池')) return 'Argon';
   if (name.includes('Claude / GPT 池 (5h)')) return 'Claude 5h';
   if (name.includes('Claude / GPT 池 (周)')) return 'Claude 周';
   if (name.startsWith('5小时')) return '5h';
@@ -140,9 +142,9 @@ export const AccountCard: React.FC<AccountCardProps> = ({
     if (account.statusMessage && account.status !== 'ok' && account.status !== 'demo') {
       return account.statusMessage;
     }
-    const parts = account.subPools
-      .slice(0, 3)
-      .map((sp) => `${compactPoolLabel(sp.name)} ${sp.pct}%`);
+    const parts = account.subPools.map(
+      (sp) => `${compactPoolLabel(sp.name)} ${sp.pct}%`
+    );
     if (account.extraBalance) {
       parts.push(`余额 ${account.extraBalance.amount}`);
     }
@@ -252,10 +254,10 @@ export const AccountCard: React.FC<AccountCardProps> = ({
             />
           </div>
           <div
-            className="mt-1.5 flex items-center justify-between gap-2 text-[10.5px]"
+            className="mt-1.5 flex items-start justify-between gap-2 text-[10.5px]"
             style={{ color: 'var(--text-sub)' }}
           >
-            <span className="truncate">{compactSummaryText}</span>
+            <span className="leading-snug">{compactSummaryText}</span>
             <span className="shrink-0 tabular-nums opacity-80">{account.resetIn}</span>
           </div>
         </button>

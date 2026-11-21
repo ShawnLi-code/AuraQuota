@@ -416,7 +416,7 @@ export async function saveAppSettings(next: AppSettings): Promise<AppSettings> {
 export async function checkForUpdates(feedUrl?: string): Promise<UpdateCheckResult> {
   if (!isTauriRuntime()) {
     return {
-      currentVersion: '0.3.8',
+      currentVersion: '0.3.9',
       hasUpdate: false,
       message: '浏览器预览模式不检查更新',
       configured: false,

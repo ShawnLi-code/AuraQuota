@@ -2,6 +2,7 @@ use crate::models::PlatformId;
 use crate::providers::antigravity::AntigravityProvider;
 use crate::providers::now_hh_mm;
 use crate::storage::AccountStore;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -220,9 +221,39 @@ pub fn pick_best_account_for_platform(
         .map(|r| r.id.clone())
 }
 
+fn antigravity_state_vscdb_mtime() -> Option<std::time::SystemTime> {
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var_os("APPDATA")?;
+        let path = Path::new(&appdata)
+            .join("Antigravity")
+            .join("User")
+            .join("globalStorage")
+            .join("state.vscdb");
+        return std::fs::metadata(path).ok()?.modified().ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")?;
+        let path = Path::new(&home)
+            .join("Library")
+            .join("Application Support")
+            .join("Antigravity")
+            .join("User")
+            .join("globalStorage")
+            .join("state.vscdb");
+        return std::fs::metadata(path).ok()?.modified().ok();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        None
+    }
+}
+
 pub fn spawn_active_window_watcher(app: AppHandle, store: Arc<AccountStore>) {
     tauri::async_runtime::spawn(async move {
         let mut last_agy_probe = Instant::now() - Duration::from_secs(60);
+        let mut last_vscdb_mtime: Option<std::time::SystemTime> = None;
         let mut cached_agy_email: Option<String> = None;
         let agy_provider = AntigravityProvider::new();
 
@@ -237,7 +268,7 @@ pub fn spawn_active_window_watcher(app: AppHandle, store: Arc<AccountStore>) {
             };
 
             if platform == PlatformId::Antigravity
-                && last_agy_probe.elapsed() >= Duration::from_secs(20)
+                && last_agy_probe.elapsed() >= Duration::from_secs(8)
             {
                 let agy_count = store
                     .list_records()
@@ -249,6 +280,7 @@ pub fn spawn_active_window_watcher(app: AppHandle, store: Arc<AccountStore>) {
                     .unwrap_or(0);
                 if agy_count > 1 {
                     last_agy_probe = Instant::now();
+                    let mut probed_email: Option<String> = None;
                     if let Ok(records) = store.list_records() {
                         if let Some(sample) = records
                             .into_iter()
@@ -258,10 +290,35 @@ pub fn spawn_active_window_watcher(app: AppHandle, store: Arc<AccountStore>) {
                             probe.email = "local@antigravity".to_string();
                             if let Ok(q) = agy_provider.fetch_from_local_server(&probe).await {
                                 if !q.email.is_empty() && q.email != "local@antigravity" {
-                                    cached_agy_email = Some(q.email);
+                                    probed_email = Some(q.email);
                                 }
                             }
                         }
+                    }
+
+                    // Fallback when Antigravity runs in standalone mode without CLI --csrf_token
+                    if probed_email.is_none() {
+                        let cur_mtime = antigravity_state_vscdb_mtime();
+                        if cur_mtime.is_some() && cur_mtime != last_vscdb_mtime {
+                            last_vscdb_mtime = cur_mtime;
+                            if let Ok(Ok(cands)) = tokio::task::spawn_blocking(
+                                crate::local_discovery::discover_antigravity_offline_candidates,
+                            )
+                            .await
+                            {
+                                if let Some(first_email) = cands
+                                    .into_iter()
+                                    .map(|c| c.email)
+                                    .find(|em| !em.is_empty() && em != "local@antigravity")
+                                {
+                                    probed_email = Some(first_email);
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(em) = probed_email {
+                        cached_agy_email = Some(em);
                     }
                 }
             }

@@ -353,6 +353,9 @@ pub struct AntigravityProvider {
     cloud_client: Client,
 }
 
+const OFFICIAL_HUB_USER_AGENT: &str =
+    "antigravity/hub/2.33.0 (aidev_client; os_type=windows; arch=amd64; cl=1023160026)";
+
 impl AntigravityProvider {
     pub fn new() -> Self {
         // Bypass system proxies so Clash/v2ray won't hijack 127.0.0.1 / [::1]
@@ -364,7 +367,7 @@ impl AntigravityProvider {
             .unwrap_or_else(|_| Client::new());
 
         let cloud_client = Client::builder()
-            .user_agent("antigravity/hub/2.9.1 windows/amd64")
+            .user_agent(OFFICIAL_HUB_USER_AGENT)
             .timeout(Duration::from_secs(12))
             .build()
             .unwrap_or_else(|_| Client::new());
@@ -549,7 +552,7 @@ impl AntigravityProvider {
             .post(&url)
             .bearer_auth(token)
             .header("Content-Type", "application/json")
-            .body(r#"{"metadata":{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}}"#)
+            .body(r#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#)
             .send()
             .await
         else {
@@ -606,74 +609,93 @@ impl AntigravityProvider {
 
         for base in base_urls {
             let (project_id, assist_tier) = self.load_code_assist(base, token).await;
-            let req_body = match project_id.as_deref() {
-                Some(pid) => serde_json::json!({ "project": pid }).to_string(),
-                None => "{}".to_string(),
-            };
+            let effective_project = project_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("aicode-consumers");
+            let req_body = serde_json::json!({ "project": effective_project }).to_string();
 
             let mut summary_json: Option<Value> = None;
+            let mut partial_summary: Option<Value> = None;
             let mut models_json: Option<Value> = None;
 
-            for url_body in [
-                (
-                    format!("{base}/v1internal:retrieveUserQuotaSummary"),
-                    req_body.clone(),
-                ),
-                (
-                    format!("{base}/v1internal:retrieveUserQuotaSummary"),
-                    "{}".to_string(),
-                ),
+            let summary_url = format!("{base}/v1internal:retrieveUserQuotaSummary");
+            for (ua, s_body) in [
+                (OFFICIAL_HUB_USER_AGENT, req_body.as_str()),
+                ("antigravity", req_body.as_str()),
+                (OFFICIAL_HUB_USER_AGENT, "{}"),
             ] {
-                if summary_json.is_some() {
-                    break;
-                }
                 if let Ok(r) = self
                     .cloud_client
-                    .post(&url_body.0)
+                    .post(&summary_url)
                     .bearer_auth(token)
+                    .header("User-Agent", ua)
                     .header("Content-Type", "application/json")
-                    .body(url_body.1)
+                    .body(s_body.to_string())
                     .send()
                     .await
                 {
-                    if r.status().as_u16() == 401 || r.status().as_u16() == 403 {
+                    let status = r.status().as_u16();
+                    if status == 401 || status == 403 {
                         saw_auth_error = true;
                     } else if r.status().is_success() {
                         if let Ok(j) = r.json::<Value>().await {
-                            if has_quota_data(&j) {
-                                summary_json = Some(j);
+                            let entries = collect_structured_entries(&j);
+                            if !entries.is_empty() {
+                                let has_gemini = entries
+                                    .iter()
+                                    .any(|e| matches!(e.category, AgyCategory::Gemini));
+                                if has_gemini {
+                                    summary_json = Some(j);
+                                    break;
+                                } else if partial_summary.is_none() {
+                                    partial_summary = Some(j);
+                                }
                             }
                         }
                     }
                 }
             }
+            if summary_json.is_none() {
+                summary_json = partial_summary;
+            }
 
             let models_url = format!("{base}/v1internal:fetchAvailableModels");
-            match self
-                .cloud_client
-                .post(&models_url)
-                .bearer_auth(token)
-                .header("Content-Type", "application/json")
-                .body(req_body.clone())
-                .send()
-                .await
-            {
-                Ok(r) => {
-                    let status = r.status();
-                    if status.as_u16() == 401 || status.as_u16() == 403 {
-                        saw_auth_error = true;
-                    } else if status.is_success() {
-                        if let Ok(j) = r.json::<Value>().await {
-                            if has_quota_data(&j) {
-                                models_json = Some(j);
-                            }
-                        }
-                    } else {
-                        last_err = format!("Cloud Code API 返回 HTTP {}", status.as_u16());
-                    }
+            for m_body in [req_body.as_str(), "{}"] {
+                if models_json.is_some() {
+                    break;
                 }
-                Err(e) => {
-                    last_err = format!("请求失败: {e}");
+                match self
+                    .cloud_client
+                    .post(&models_url)
+                    .bearer_auth(token)
+                    .header("Content-Type", "application/json")
+                    .body(m_body.to_string())
+                    .send()
+                    .await
+                {
+                    Ok(r) => {
+                        let status = r.status();
+                        if status.as_u16() == 401 || status.as_u16() == 403 {
+                            saw_auth_error = true;
+                            continue;
+                        } else if status.is_success() {
+                            if let Ok(j) = r.json::<Value>().await {
+                                if has_quota_data(&j) {
+                                    models_json = Some(j);
+                                }
+                            }
+                            break;
+                        } else {
+                            last_err = format!("Cloud Code API 返回 HTTP {}", status.as_u16());
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        last_err = format!("请求失败: {e}");
+                        break;
+                    }
                 }
             }
 
@@ -1579,7 +1601,7 @@ fn collect_structured_entries(json: &Value) -> Vec<AgyQuotaEntry> {
                 .and_then(|v| v.as_array());
             if let Some(buckets_arr) = buckets {
                 for b in buckets_arr {
-                    if let Some((pct, reset)) = extract_bucket_pct_and_reset(b, false) {
+                    if let Some((pct, reset)) = extract_bucket_pct_and_reset(b, true) {
                         let b_label = extract_object_label_tokens(b);
                         let combined = format!("{group_label} {b_label}");
                         let category = classify_agy_category(&combined);
@@ -2340,6 +2362,52 @@ Active Connections
             clients.iter().any(|c| c.key == "antigravity_personal"),
             "expected antigravity_personal client from local binary, got {} entries",
             clients.len()
+        );
+    }
+
+    #[test]
+    fn parses_full_argon_weekly_without_reset_time() {
+        let payload = serde_json::json!({
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        { "bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.04, "resetTime": "2099-01-01T01:41:00Z" },
+                        { "bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.72, "resetTime": "2099-01-07T20:00:00Z" }
+                    ]
+                },
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        { "bucketId": "3p-5h", "window": "5h", "remainingFraction": 1.0 },
+                        { "bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 1.0 }
+                    ]
+                },
+                {
+                    "displayName": "Gemini 4 Argon",
+                    "buckets": [
+                        { "bucketId": "gemini-argon-wtu-weekly", "window": "weekly", "remainingFraction": 1.0 }
+                    ]
+                }
+            ]
+        });
+
+        let quota = parse_antigravity_quota(&sample_record(), &payload).expect("should parse all 5 pools");
+        assert_eq!(quota.primary_pct, 4);
+        let pools: Vec<(&str, u8)> = quota
+            .sub_pools
+            .iter()
+            .map(|p| (p.name.as_str(), p.pct))
+            .collect();
+        assert_eq!(
+            pools,
+            vec![
+                ("Gemini 模型池 (5h)", 4),
+                ("Gemini 模型池 (周)", 72),
+                ("Argon 模型池 (周)", 100),
+                ("Claude / GPT 池 (5h)", 100),
+                ("Claude / GPT 池 (周)", 100),
+            ]
         );
     }
 }

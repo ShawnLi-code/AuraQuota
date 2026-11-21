@@ -254,6 +254,35 @@ impl AccountStore {
             return Ok(false);
         }
 
+        // Preserve a recently detected quota-drop spotlight on the same platform for 60s so
+        // foreground window polling doesn't clobber an account whose quota just decreased.
+        let protect_same_platform_drop = !force_override_pin
+            && guard
+                .active_account_id
+                .as_deref()
+                .filter(|cur_id| *cur_id != id)
+                .and_then(|cur_id| {
+                    let cur_acc = guard.accounts.iter().find(|a| a.id == cur_id)?;
+                    let target_acc = guard.accounts.iter().find(|a| a.id == id)?;
+                    if cur_acc.platform != target_acc.platform {
+                        return None;
+                    }
+                    let reason_is_drop = guard
+                        .active_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("额度刚变化"));
+                    let ts = guard.last_active_map.get(cur_id).copied().unwrap_or(0);
+                    Some(reason_is_drop && (now_ms - ts) < 60_000)
+                })
+                .unwrap_or(false);
+
+        if protect_same_platform_drop {
+            if ts_moved {
+                self.save_locked(&guard)?;
+            }
+            return Ok(false);
+        }
+
         let changed = guard.active_account_id.as_deref() != Some(id)
             || guard.active_reason.as_deref() != Some(reason);
         guard.active_account_id = Some(id.to_string());
@@ -814,6 +843,77 @@ mod tests {
             .expect("decrypt")
             .expect("some creds");
         assert_eq!(decrypted.session_key.as_deref(), Some(secret_marker));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_platform_foreground_poll_does_not_clobber_recent_quota_drop() {
+        let dir = std::env::temp_dir().join(format!("auraquota_active_test_{}", uuid::Uuid::new_v4()));
+        let vault_path = dir.join("accounts.vault.json");
+        let store = AccountStore::with_path(vault_path).expect("create store");
+
+        let mk_req = |alias: &str, email: &str| AddAccountRequest {
+            platform: PlatformId::Antigravity,
+            alias: alias.into(),
+            email: email.into(),
+            tier: SubscriptionTier::Paid,
+            plan_label: "AI Pro".into(),
+            auth_method: AuthMethod::OauthToken,
+            secret_input: None,
+            refresh_token: None,
+            profile_id: None,
+        };
+        let mk_quota = |id: &str, alias: &str, email: &str, pct: u8| AccountQuota {
+            id: id.into(),
+            platform: PlatformId::Antigravity,
+            alias: alias.into(),
+            email: email.into(),
+            tier: SubscriptionTier::Paid,
+            plan_label: "AI Pro".into(),
+            primary_pct: pct,
+            reset_in: "4h".into(),
+            sub_pools: vec![],
+            status: AccountStatus::Ok,
+            status_message: None,
+            extra_balance: None,
+            auth_method: AuthMethod::OauthToken,
+            last_synced_at: None,
+            is_demo: false,
+        };
+
+        let a = store
+            .add_account(&mk_req("A", "a@example.com"), None, Some("agy-a".into()), None, None)
+            .expect("add a");
+        let b = store
+            .add_account(&mk_req("B", "b@example.com"), None, Some("agy-b".into()), None, None)
+            .expect("add b");
+
+        store
+            .update_cached_quota(&mk_quota(&a.id, "A", "a@example.com", 100))
+            .expect("seed a");
+        store
+            .update_cached_quota(&mk_quota(&b.id, "B", "b@example.com", 100))
+            .expect("seed b");
+        store
+            .set_active_account(&a.id, "反重力 使用中", false)
+            .expect("focus a");
+
+        // Account B quota drops -> auto-pins B
+        store
+            .update_cached_quota(&mk_quota(&b.id, "B", "b@example.com", 95))
+            .expect("drop b");
+        let (_, active_after_drop, reason) = store.current_active_state();
+        assert_eq!(active_after_drop.as_deref(), Some("agy-b"));
+        assert!(reason.as_deref().unwrap_or("").contains("额度刚变化"));
+
+        // Foreground window tracker probing A must not clobber B within 60s
+        let changed = store
+            .set_active_account(&a.id, "反重力 使用中", false)
+            .expect("foreground attempt a");
+        assert!(!changed);
+        let (_, still_active, _) = store.current_active_state();
+        assert_eq!(still_active.as_deref(), Some("agy-b"));
 
         let _ = fs::remove_dir_all(&dir);
     }
