@@ -199,8 +199,9 @@ pub fn parse_scraped_payload(
         }
         PlatformId::Commandcode => {
             let credits = payload.get("creditsJson")?;
+            let sub = payload.get("subJson");
             let summary = payload.get("summaryJson");
-            commandcode::parse_commandcode_response(record, credits, summary)
+            commandcode::parse_commandcode_full(record, credits, sub, summary)
         }
         PlatformId::Opencode => {
             let usage = payload.get("apiUsage")?;

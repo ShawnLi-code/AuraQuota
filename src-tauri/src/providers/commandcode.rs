@@ -8,6 +8,7 @@ use crate::providers::{
 };
 use crate::webview_scraper::scrape_hidden_profile;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -76,18 +77,10 @@ impl QuotaProvider for CommandCodeProvider {
         let api_key = c.api_key.as_deref().filter(|s| !s.is_empty());
         let cookie = c.cookie_header.as_deref().filter(|s| !s.is_empty());
 
-        let (credits_url, summary_url, is_bearer) = if api_key.is_some() {
-            (
-                "https://api.commandcode.ai/alpha/billing/credits",
-                None,
-                true,
-            )
+        let credits_url = if api_key.is_some() {
+            "https://api.commandcode.ai/alpha/billing/credits"
         } else if cookie.is_some() {
-            (
-                "https://api.commandcode.ai/internal/billing/credits",
-                Some("https://api.commandcode.ai/internal/usage/summary"),
-                false,
-            )
+            "https://api.commandcode.ai/internal/billing/credits"
         } else {
             return make_error_quota(
                 record,
@@ -96,17 +89,35 @@ impl QuotaProvider for CommandCodeProvider {
             );
         };
 
-        let mut req = self
-            .client
-            .get(credits_url)
-            .header("Accept", "application/json");
-        if is_bearer {
-            req = req.bearer_auth(api_key.unwrap());
+        let sub_url = if api_key.is_some() {
+            "https://api.commandcode.ai/alpha/billing/subscriptions"
         } else {
-            req = req.header("Cookie", cookie.unwrap());
-        }
+            "https://api.commandcode.ai/internal/billing/subscriptions"
+        };
 
-        let resp = match req.send().await {
+        let summary_url = if api_key.is_some() {
+            "https://api.commandcode.ai/alpha/usage/summary"
+        } else {
+            "https://api.commandcode.ai/internal/usage/summary"
+        };
+
+        let send_get = |url: &str| {
+            let mut req = self.client.get(url);
+            if let Some(key) = api_key {
+                req = req
+                    .bearer_auth(key)
+                    .header("Accept", "application/json");
+            } else if let Some(ck) = cookie {
+                req = req
+                    .header("Cookie", ck)
+                    .header("Accept", "application/json, text/plain, */*")
+                    .header("Origin", "https://commandcode.ai")
+                    .header("Referer", "https://commandcode.ai/");
+            }
+            req
+        };
+
+        let resp = match send_get(credits_url).send().await {
             Ok(r) => r,
             Err(e) => {
                 return make_error_quota(record, AccountStatus::Error, format!("网络错误: {e}"));
@@ -136,32 +147,91 @@ impl QuotaProvider for CommandCodeProvider {
             }
         };
 
-        let summary_json = if let Some(s_url) = summary_url {
-            if let Ok(sr) = self
-                .client
-                .get(s_url)
-                .header("Cookie", cookie.unwrap())
-                .header("Accept", "application/json")
-                .send()
-                .await
-            {
-                sr.json::<Value>().await.ok()
-            } else {
-                None
+        // 并发或顺次补充订阅方案接口 (/billing/subscriptions)，用于确定月度总 Grant（如 GOAT = $70）与周期结束时间
+        let sub_json = match send_get(sub_url).send().await {
+            Ok(sr) if sr.status().is_success() => sr.json::<Value>().await.ok(),
+            _ => None,
+        };
+
+        let has_windows = credits_json.get("windowLimits").is_some()
+            || credits_json.pointer("/credits/windowLimits").is_some()
+            || credits_json.pointer("/data/windowLimits").is_some()
+            || credits_json.get("windows").is_some()
+            || credits_json.pointer("/data/windows").is_some();
+
+        let summary_json = if !has_windows {
+            match send_get(summary_url).send().await {
+                Ok(sr) if sr.status().is_success() => sr.json::<Value>().await.ok(),
+                _ => None,
             }
         } else {
             None
         };
 
-        parse_commandcode_response(record, &credits_json, summary_json.as_ref()).unwrap_or_else(
-            || {
-                make_error_quota(
-                    record,
-                    AccountStatus::Error,
-                    "无法识别 Command Code 额度数据结构",
-                )
-            },
+        parse_commandcode_full(
+            record,
+            &credits_json,
+            sub_json.as_ref(),
+            summary_json.as_ref(),
         )
+        .unwrap_or_else(|| {
+            make_error_quota(
+                record,
+                AccountStatus::Error,
+                "无法识别 Command Code 额度数据结构",
+            )
+        })
+    }
+}
+
+fn flex_f64(v: &Value) -> Option<f64> {
+    if let Some(n) = v.as_f64() {
+        if n.is_finite() {
+            return Some(n);
+        }
+    }
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        if let Ok(n) = trimmed.parse::<f64>() {
+            if n.is_finite() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn flex_reset_countdown(v: &Value) -> Option<String> {
+    if let Some(ts) = flex_f64(v) {
+        if ts > 0.0 {
+            let secs = if ts > 10_000_000_000.0 {
+                (ts / 1000.0) as i64
+            } else {
+                ts as i64
+            };
+            if let Some(dt) = DateTime::<Utc>::from_timestamp(secs, 0) {
+                return Some(format_reset_countdown(&dt.to_rfc3339()));
+            }
+        }
+    }
+    v.as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(format_reset_countdown)
+}
+
+fn catalog_plan_info(raw: &str) -> Option<(SubscriptionTier, &'static str, Option<f64>)> {
+    match raw.trim().to_lowercase().as_str() {
+        "individual-goat" | "goat" => Some((SubscriptionTier::Paid, "GOAT", Some(70.0))),
+        "individual-go" | "individual-go-v1" | "go" => {
+            Some((SubscriptionTier::Paid, "Go", Some(10.0)))
+        }
+        "individual-pro-v1" => Some((SubscriptionTier::Paid, "Pro", Some(80.0))),
+        "individual-pro" | "pro" => Some((SubscriptionTier::Paid, "Pro", Some(30.0))),
+        "individual-max" | "max" => Some((SubscriptionTier::Paid, "Max", Some(150.0))),
+        "individual-ultra" | "ultra" => Some((SubscriptionTier::Paid, "Ultra", Some(300.0))),
+        "free" => Some((SubscriptionTier::Free, "Free", None)),
+        _ => None,
     }
 }
 
@@ -170,51 +240,126 @@ pub fn parse_commandcode_response(
     credits_json: &Value,
     summary_json: Option<&Value>,
 ) -> Option<AccountQuota> {
-    let data = credits_json.get("data").unwrap_or(credits_json);
+    parse_commandcode_full(record, credits_json, None, summary_json)
+}
+
+pub fn parse_commandcode_full(
+    record: &StoredAccountRecord,
+    credits_json: &Value,
+    sub_json: Option<&Value>,
+    summary_json: Option<&Value>,
+) -> Option<AccountQuota> {
+    let has_credits_wrapper = credits_json.get("credits").is_some();
+    let credits_obj = credits_json
+        .get("credits")
+        .or_else(|| credits_json.get("data"))
+        .unwrap_or(credits_json);
     let summary_data = summary_json.map(|s| s.get("data").unwrap_or(s));
 
-    let sub_remaining = data
-        .get("subscriptionCredits")
-        .or_else(|| data.get("monthlyCredits"))
-        .or_else(|| data.get("planCreditsRemaining"))
-        .and_then(|v| v.as_f64());
+    // Subscription (/billing/subscriptions) 解析
+    let sub_envelope_ok = sub_json
+        .and_then(|s| s.get("success").and_then(|v| v.as_bool()))
+        .unwrap_or(true);
+    let sub_explicit_free = sub_json.is_some_and(|s| {
+        sub_envelope_ok && s.get("data").is_some_and(|d| d.is_null())
+    });
+    let sub_data = sub_json
+        .filter(|_| sub_envelope_ok)
+        .and_then(|s| s.get("data"))
+        .filter(|d| d.is_object())
+        .or_else(|| sub_json.filter(|s| s.get("planId").is_some()));
 
-    let sub_limit = data
-        .get("subscriptionLimit")
-        .or_else(|| data.get("monthlyLimit"))
-        .or_else(|| data.get("planCreditsLimit"))
-        .and_then(|v| v.as_f64());
+    let sub_plan_id = sub_data
+        .and_then(|d| {
+            d.get("planId")
+                .or_else(|| d.get("plan"))
+                .or_else(|| d.get("planName"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            credits_obj
+                .get("plan")
+                .or_else(|| credits_obj.get("planId"))
+                .or_else(|| credits_obj.get("planName"))
+                .or_else(|| credits_obj.get("tier"))
+                .and_then(|v| v.as_str())
+        });
 
-    let purchased = data
+    let (tier, plan_label, catalog_grant_usd) = if sub_explicit_free {
+        (SubscriptionTier::Free, "Free".to_string(), None)
+    } else if let Some(raw_plan) = sub_plan_id {
+        if let Some((t, lbl, usd)) = catalog_plan_info(raw_plan) {
+            (t, lbl.to_string(), usd)
+        } else {
+            (record.tier, raw_plan.to_string(), None)
+        }
+    } else if let Some((t, lbl, usd)) = catalog_plan_info(&record.plan_label) {
+        (t, lbl.to_string(), usd)
+    } else {
+        (record.tier, record.plan_label.clone(), None)
+    };
+
+    let sub_remaining = credits_obj
+        .get("monthlyCredits")
+        .or_else(|| credits_obj.get("subscriptionCredits"))
+        .or_else(|| credits_obj.get("planCreditsRemaining"))
+        .and_then(flex_f64);
+
+    let sub_limit = credits_obj
+        .get("monthlyCreditsGranted")
+        .or_else(|| credits_obj.get("subscriptionLimit"))
+        .or_else(|| credits_obj.get("monthlyLimit"))
+        .or_else(|| credits_obj.get("planCreditsLimit"))
+        .and_then(flex_f64)
+        .filter(|v| *v > 0.0)
+        .or(catalog_grant_usd);
+
+    let purchased = credits_obj
         .get("purchasedCredits")
-        .or_else(|| data.get("extraCredits"))
-        .and_then(|v| v.as_f64())
+        .or_else(|| credits_obj.get("extraCredits"))
+        .and_then(flex_f64)
         .unwrap_or(0.0);
 
-    let five_hour_pct = extract_window_remaining(data, &["fiveHour", "five_hour", "5h", "rolling"])
-        .or_else(|| {
-            summary_data.and_then(|s| {
-                extract_window_remaining(s, &["fiveHour", "five_hour", "5h", "rolling"])
-            })
-        });
+    let (five_hour_pct, five_hour_reset) =
+        extract_window_remaining_from_sources(
+            &[
+                credits_json.get("windowLimits"),
+                credits_obj.get("windowLimits"),
+                Some(credits_obj),
+                summary_data,
+            ],
+            &["fiveHour", "five_hour", "5h", "rolling"],
+        );
 
-    let seven_day_pct = extract_window_remaining(data, &["weekly", "sevenDay", "seven_day", "7d"])
-        .or_else(|| {
-            summary_data.and_then(|s| {
-                extract_window_remaining(s, &["weekly", "sevenDay", "seven_day", "7d"])
-            })
-        });
+    let (seven_day_pct, seven_day_reset) =
+        extract_window_remaining_from_sources(
+            &[
+                credits_json.get("windowLimits"),
+                credits_obj.get("windowLimits"),
+                Some(credits_obj),
+                summary_data,
+            ],
+            &["weekly", "sevenDay", "seven_day", "7d"],
+        );
 
-    let monthly_pct = extract_window_remaining(data, &["monthly", "month"])
-        .or_else(|| {
-            summary_data.and_then(|s| extract_window_remaining(s, &["monthly", "month"]))
-        })
-        .or_else(|| match (sub_remaining, sub_limit) {
-            (Some(rem), Some(lim)) if lim > 0.0 => Some(clamp_pct((rem / lim) * 100.0)),
-            _ => None,
-        });
+    let (monthly_explicit_pct, _) = extract_window_remaining_from_sources(
+        &[
+            credits_json.get("windowLimits"),
+            credits_obj.get("windowLimits"),
+            Some(credits_obj),
+            summary_data,
+        ],
+        &["monthly", "month"],
+    );
 
-    if five_hour_pct.is_none()
+    let monthly_pct = monthly_explicit_pct.or_else(|| match (sub_remaining, sub_limit) {
+        (Some(rem), Some(lim)) if lim > 0.0 => Some(clamp_pct((rem / lim) * 100.0)),
+        (Some(rem), None) if rem <= 0.0 => Some(0),
+        _ => None,
+    });
+
+    if !has_credits_wrapper
+        && five_hour_pct.is_none()
         && seven_day_pct.is_none()
         && monthly_pct.is_none()
         && sub_remaining.is_none()
@@ -228,7 +373,7 @@ pub fn parse_commandcode_response(
             name: "5小时窗口（月额 20%）".to_string(),
             pct: p5,
             detail: None,
-            reset_in: None,
+            reset_in: five_hour_reset.clone(),
         });
     }
     if let Some(p7) = seven_day_pct {
@@ -236,7 +381,7 @@ pub fn parse_commandcode_response(
             name: "7天周窗口（月额 50%）".to_string(),
             pct: p7,
             detail: None,
-            reset_in: None,
+            reset_in: seven_day_reset.clone(),
         });
     }
 
@@ -246,40 +391,32 @@ pub fn parse_commandcode_response(
         _ => Some("仅统计订阅月度额度".to_string()),
     };
 
+    let period_reset = sub_data
+        .and_then(|d| d.get("currentPeriodEnd"))
+        .and_then(flex_reset_countdown)
+        .or_else(|| {
+            credits_obj
+                .get("resetsAt")
+                .or_else(|| credits_obj.get("expiresAt"))
+                .and_then(flex_reset_countdown)
+        });
+
     let final_monthly_pct = monthly_pct.unwrap_or(100);
     sub_pools.push(SubPool {
         name: "月度包含额度".to_string(),
         pct: final_monthly_pct,
         detail: monthly_detail,
-        reset_in: None,
+        reset_in: period_reset.clone(),
     });
 
     let primary_pct = five_hour_pct
         .or(seven_day_pct)
         .unwrap_or(final_monthly_pct);
 
-    let reset_in = data
-        .get("resetsAt")
-        .or_else(|| data.get("expiresAt"))
-        .and_then(|v| v.as_str())
-        .map(format_reset_countdown)
+    let reset_in = five_hour_reset
+        .or(seven_day_reset)
+        .or(period_reset)
         .unwrap_or_else(|| "周期监控中".to_string());
-
-    let plan_raw = data
-        .get("plan")
-        .or_else(|| data.get("planName"))
-        .or_else(|| data.get("tier"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&record.plan_label);
-
-    let (tier, plan_label) = match plan_raw.to_lowercase().as_str() {
-        "goat" => (SubscriptionTier::Paid, "GOAT".to_string()),
-        "go" => (SubscriptionTier::Paid, "Go".to_string()),
-        "pro" => (SubscriptionTier::Paid, "Pro".to_string()),
-        "max" => (SubscriptionTier::Paid, "Max".to_string()),
-        "free" => (SubscriptionTier::Free, "Free".to_string()),
-        _ => (record.tier, record.plan_label.clone()),
-    };
 
     let extra_balance = Some(ExtraBalance {
         label: "充值余额 (Purchased Credits)".to_string(),
@@ -306,23 +443,49 @@ pub fn parse_commandcode_response(
     })
 }
 
-fn extract_window_remaining(root: &Value, keys: &[&str]) -> Option<u8> {
-    let windows = root.get("windows").or_else(|| root.get("usage")).unwrap_or(root);
-    for key in keys {
-        if let Some(obj) = windows.get(*key) {
-            if let Some(rem) = obj.get("remainingPercent").and_then(|v| v.as_f64()) {
-                return Some(clamp_pct(rem));
-            }
-            if let Some(used) = obj
-                .get("usedPercent")
-                .or_else(|| obj.get("percent"))
-                .and_then(|v| v.as_f64())
-            {
-                return Some(clamp_pct(100.0 - used));
+fn extract_window_remaining_from_sources(
+    sources: &[Option<&Value>],
+    keys: &[&str],
+) -> (Option<u8>, Option<String>) {
+    for src_opt in sources {
+        let Some(src) = src_opt else { continue };
+        let containers = [
+            Some(*src),
+            src.get("windowLimits"),
+            src.get("windows"),
+            src.get("usage"),
+        ];
+        for container in containers.into_iter().flatten() {
+            for key in keys {
+                if let Some(obj) = container.get(*key) {
+                    let reset = obj
+                        .get("resetAt")
+                        .or_else(|| obj.get("resetsAt"))
+                        .and_then(flex_reset_countdown);
+                    if let (Some(cap), used_opt) = (
+                        obj.get("cap").and_then(flex_f64),
+                        obj.get("used").and_then(flex_f64),
+                    ) {
+                        if cap > 0.0 {
+                            let used = used_opt.unwrap_or(0.0).max(0.0);
+                            return (Some(clamp_pct(((cap - used) / cap) * 100.0)), reset);
+                        }
+                    }
+                    if let Some(rem) = obj.get("remainingPercent").and_then(flex_f64) {
+                        return (Some(clamp_pct(rem)), reset);
+                    }
+                    if let Some(used) = obj
+                        .get("usedPercent")
+                        .or_else(|| obj.get("percent"))
+                        .and_then(flex_f64)
+                    {
+                        return (Some(clamp_pct(100.0 - used)), reset);
+                    }
+                }
             }
         }
     }
-    None
+    (None, None)
 }
 
 #[cfg(test)]
@@ -371,5 +534,80 @@ mod tests {
         let extra = quota.extra_balance.expect("must have separate extra_balance");
         assert_eq!(extra.amount, "$110.00");
         assert!(extra.label.contains("Purchased Credits"));
+    }
+
+    #[test]
+    fn parses_real_commandcode_credits_nested_and_root_window_limits() {
+        let rec = StoredAccountRecord {
+            id: "cc-real".into(),
+            platform: PlatformId::Commandcode,
+            alias: "GOAT".into(),
+            email: "user@example.com".into(),
+            tier: SubscriptionTier::Paid,
+            plan_label: "GOAT".into(),
+            auth_method: AuthMethod::WebviewSession,
+            profile_dir: None,
+            is_demo: false,
+            encrypted_secret: None,
+            cached_quota: None,
+        };
+
+        // 真实 /internal/billing/credits 嵌套 windowLimits + 字符串数字 + 订阅接口 individual-goat ($70)
+        let nested_credits = json!({
+            "credits": {
+                "monthlyCredits": 52.5,
+                "purchasedCredits": 12.0,
+                "premiumMonthlyCredits": 0,
+                "opensourceMonthlyCredits": 0,
+                "windowLimits": {
+                    "fiveHour": {
+                        "cap": "4",
+                        "used": "1",
+                        "resetAt": "1780200000"
+                    },
+                    "weekly": {
+                        "cap": 20,
+                        "used": 4,
+                        "resetAt": 1780300000000i64
+                    }
+                }
+            }
+        });
+        let sub = json!({
+            "success": true,
+            "data": {
+                "planId": "individual-goat",
+                "status": "active",
+                "currentPeriodEnd": "2099-01-01T00:00:00Z"
+            }
+        });
+
+        let quota =
+            parse_commandcode_full(&rec, &nested_credits, Some(&sub), None).expect("nested");
+        assert_eq!(quota.plan_label, "GOAT");
+        assert_eq!(quota.primary_pct, 75);
+        assert_eq!(quota.sub_pools[0].pct, 75); // 5h: (4-1)/4 = 75%
+        assert_eq!(quota.sub_pools[1].pct, 80); // weekly: (20-4)/20 = 80%
+        assert_eq!(quota.sub_pools[2].pct, 75); // monthly: 52.5 / 70.0 = 75%
+        assert_eq!(
+            quota.extra_balance.as_ref().expect("purchased").amount,
+            "$12.00"
+        );
+
+        // 真实顶层 windowLimits 结构
+        let root_credits = json!({
+            "credits": {
+                "monthlyCredits": 8.5,
+                "purchasedCredits": 0
+            },
+            "windowLimits": {
+                "fiveHour": { "cap": 3, "used": 0.75 },
+                "weekly": { "cap": 15, "used": 1.5 }
+            }
+        });
+        let quota_root =
+            parse_commandcode_full(&rec, &root_credits, None, None).expect("root");
+        assert_eq!(quota_root.primary_pct, 75);
+        assert_eq!(quota_root.sub_pools[1].pct, 90);
     }
 }

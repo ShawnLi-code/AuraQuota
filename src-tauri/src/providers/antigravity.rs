@@ -19,6 +19,7 @@ pub struct LocalServerInfo {
     pub pid: u32,
     pub process_name: String,
     pub csrf_token: String,
+    pub extra_csrf_tokens: Vec<String>,
     pub ports: Vec<u16>,
     pub priority_score: i32,
 }
@@ -39,7 +40,7 @@ impl AntigravityProvider {
             .unwrap_or_else(|_| Client::new());
 
         let cloud_client = Client::builder()
-            .user_agent("antigravity/1.15.8 windows/amd64")
+            .user_agent("antigravity/hub/2.9.1 windows/amd64")
             .timeout(Duration::from_secs(12))
             .build()
             .unwrap_or_else(|_| Client::new());
@@ -63,16 +64,30 @@ impl AntigravityProvider {
         let rpc_status = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
         let rpc_configs = "/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs";
 
-        let request_bodies = [
+        let summary_bodies = [
+            r#"{"forceRefresh":true}"#,
             "{}",
             r#"{"metadata":{"ideName":"antigravity","extensionName":"antigravity","locale":"en"}}"#,
+        ];
+        let meta_bodies = [
+            r#"{"metadata":{"ideName":"antigravity","extensionName":"antigravity","ideVersion":"unknown","locale":"en"}}"#,
+            "{}",
         ];
 
         let mut total_ports = 0usize;
         let mut last_http_status: Option<u16> = None;
+        let mut best_matching_fallback: Option<AccountQuota> = None;
+        let mut best_mismatch: Option<(bool, AccountQuota)> = None;
 
         for info in &servers {
             total_ports += info.ports.len();
+            let mut csrf_list = vec![info.csrf_token.as_str()];
+            for tok in &info.extra_csrf_tokens {
+                if tok != &info.csrf_token {
+                    csrf_list.push(tok.as_str());
+                }
+            }
+
             for port in &info.ports {
                 for host in ["127.0.0.1", "[::1]"] {
                     for scheme in ["https", "http"] {
@@ -85,52 +100,65 @@ impl AntigravityProvider {
                             if connection_dead {
                                 break;
                             }
-                            // Once RetrieveUserQuotaSummary succeeds AND we already hit GetUserStatus, stop
                             if path == rpc_configs
                                 && (summary_json.is_some() || status_json.is_some())
                             {
                                 break;
                             }
-                            for body in &request_bodies {
-                                let url = format!("{base}{path}");
-                                let resp = self
-                                    .loopback_client
-                                    .post(&url)
-                                    .header("X-Codeium-Csrf-Token", &info.csrf_token)
-                                    .header("Connect-Protocol-Version", "1")
-                                    .header("Content-Type", "application/json")
-                                    .body(*body)
-                                    .send()
-                                    .await;
+                            let bodies: &[&str] = if path == rpc_summary {
+                                &summary_bodies
+                            } else {
+                                &meta_bodies
+                            };
+                            'body_loop: for body in bodies {
+                                for csrf in &csrf_list {
+                                    let url = format!("{base}{path}");
+                                    let resp = self
+                                        .loopback_client
+                                        .post(&url)
+                                        .header("X-Codeium-Csrf-Token", *csrf)
+                                        .header("Connect-Protocol-Version", "1")
+                                        .header("Content-Type", "application/json")
+                                        .body(*body)
+                                        .send()
+                                        .await;
 
-                                match resp {
-                                    Ok(r) => {
-                                        let status = r.status();
-                                        if status.is_success() {
-                                            if let Ok(json) = r.json::<Value>().await {
-                                                if path == rpc_summary {
-                                                    if has_quota_data(&json) {
-                                                        summary_json = Some(json);
-                                                        break;
-                                                    }
-                                                } else if path == rpc_status {
-                                                    if has_quota_data(&json) || has_user_meta(&json)
-                                                    {
+                                    match resp {
+                                        Ok(r) => {
+                                            let status = r.status();
+                                            if status.is_success() {
+                                                if let Ok(json) = r.json::<Value>().await {
+                                                    if path == rpc_summary {
+                                                        if has_quota_data(&json) {
+                                                            summary_json = Some(json);
+                                                            break 'body_loop;
+                                                        }
+                                                    } else if path == rpc_status {
+                                                        if has_quota_data(&json)
+                                                            || has_user_meta(&json)
+                                                        {
+                                                            status_json = Some(json);
+                                                            break 'body_loop;
+                                                        }
+                                                    } else if has_quota_data(&json) {
                                                         status_json = Some(json);
-                                                        break;
+                                                        break 'body_loop;
                                                     }
-                                                } else if has_quota_data(&json) {
-                                                    status_json = Some(json);
+                                                }
+                                                break;
+                                            } else {
+                                                last_http_status = Some(status.as_u16());
+                                                if status.as_u16() != 401 && status.as_u16() != 403
+                                                {
                                                     break;
                                                 }
                                             }
-                                        } else {
-                                            last_http_status = Some(status.as_u16());
                                         }
-                                    }
-                                    Err(e) => {
-                                        if e.is_connect() || e.is_timeout() {
-                                            connection_dead = true;
+                                        Err(e) => {
+                                            if e.is_connect() || e.is_timeout() {
+                                                connection_dead = true;
+                                                break 'body_loop;
+                                            }
                                             break;
                                         }
                                     }
@@ -139,17 +167,37 @@ impl AntigravityProvider {
                         }
 
                         if summary_json.is_some() || status_json.is_some() {
+                            let has_summary = summary_json.is_some();
                             if let Some(quota) = merge_antigravity_quotas(
                                 record,
                                 summary_json.as_ref(),
                                 status_json.as_ref(),
                             ) {
-                                return Ok(quota);
+                                if email_matches_strict(&record.email, &quota.email) {
+                                    if has_summary {
+                                        return Ok(quota);
+                                    }
+                                    if best_matching_fallback.is_none() {
+                                        best_matching_fallback = Some(quota);
+                                    }
+                                } else if best_mismatch
+                                    .as_ref()
+                                    .is_none_or(|(prev_sum, _)| !*prev_sum && has_summary)
+                                {
+                                    best_mismatch = Some((has_summary, quota));
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+
+        if let Some(quota) = best_matching_fallback {
+            return Ok(quota);
+        }
+        if let Some((_, quota)) = best_mismatch {
+            return Ok(quota);
         }
 
         let status_note = last_http_status
@@ -215,13 +263,14 @@ impl AntigravityProvider {
         token: &str,
     ) -> Result<AccountQuota, (AccountStatus, String)> {
         let base_urls = [
-            "https://cloudcode-pa.googleapis.com",
             "https://daily-cloudcode-pa.googleapis.com",
+            "https://cloudcode-pa.googleapis.com",
             "https://daily-cloudcode-pa.sandbox.googleapis.com",
         ];
 
         let mut saw_auth_error = false;
         let mut last_err = "Cloud Code API 未返回有效数据".to_string();
+        let mut fallback_quota: Option<AccountQuota> = None;
 
         for base in base_urls {
             let (project_id, assist_tier) = self.load_code_assist(base, token).await;
@@ -234,8 +283,14 @@ impl AntigravityProvider {
             let mut models_json: Option<Value> = None;
 
             for url_body in [
-                (format!("{base}/v1internal:retrieveUserQuotaSummary"), req_body.clone()),
-                (format!("{base}/v1internal:retrieveUserQuotaSummary"), "{}".to_string()),
+                (
+                    format!("{base}/v1internal:retrieveUserQuotaSummary"),
+                    req_body.clone(),
+                ),
+                (
+                    format!("{base}/v1internal:retrieveUserQuotaSummary"),
+                    "{}".to_string(),
+                ),
             ] {
                 if summary_json.is_some() {
                     break;
@@ -267,7 +322,7 @@ impl AntigravityProvider {
                 .post(&models_url)
                 .bearer_auth(token)
                 .header("Content-Type", "application/json")
-                .body(req_body)
+                .body(req_body.clone())
                 .send()
                 .await
             {
@@ -290,6 +345,42 @@ impl AntigravityProvider {
                 }
             }
 
+            // 当 RetrieveUserQuotaSummary 不可用，且 fetchAvailableModels 全返回 100% 占位或被拒时，调用 retrieveUserQuota 获取真实逐模型桶额度
+            let models_all_full = models_json
+                .as_ref()
+                .is_some_and(all_models_look_full_placeholder);
+            if summary_json.is_none() && (models_json.is_none() || models_all_full) {
+                for quota_base in [base, "https://cloudcode-pa.googleapis.com"] {
+                    if summary_json.is_some() {
+                        break;
+                    }
+                    let q_url = format!("{quota_base}/v1internal:retrieveUserQuota");
+                    for q_body in [req_body.clone(), "{}".to_string()] {
+                        if let Ok(r) = self
+                            .cloud_client
+                            .post(&q_url)
+                            .bearer_auth(token)
+                            .header("Content-Type", "application/json")
+                            .body(q_body)
+                            .send()
+                            .await
+                        {
+                            if r.status().as_u16() == 401 || r.status().as_u16() == 403 {
+                                saw_auth_error = true;
+                            } else if r.status().is_success() {
+                                if let Ok(j) = r.json::<Value>().await {
+                                    if has_quota_data(&j) {
+                                        summary_json = Some(j);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let has_structured = summary_json.is_some();
             if let Some(mut quota) =
                 merge_antigravity_quotas(record, summary_json.as_ref(), models_json.as_ref())
             {
@@ -309,8 +400,17 @@ impl AntigravityProvider {
                         quota.email = email;
                     }
                 }
-                return Ok(quota);
+                if has_structured || !models_all_full {
+                    return Ok(quota);
+                }
+                if fallback_quota.is_none() {
+                    fallback_quota = Some(quota);
+                }
             }
+        }
+
+        if let Some(quota) = fallback_quota {
+            return Ok(quota);
         }
 
         if saw_auth_error {
@@ -639,6 +739,18 @@ pub fn discover_local_language_servers() -> Result<Vec<LocalServerInfo>, String>
                 continue;
             };
 
+            let mut extra_csrf_tokens = Vec::new();
+            for flag in [
+                "--extension_server_csrf_token",
+                "--extension-server-csrf-token",
+            ] {
+                if let Some(tok) = extract_flag_value(&cmd, &[flag]) {
+                    if tok != csrf_token && !extra_csrf_tokens.contains(&tok) {
+                        extra_csrf_tokens.push(tok);
+                    }
+                }
+            }
+
             let mut ports_set = BTreeSet::new();
             for p in parse_netstat_listening_ports(&netstat_output, pid) {
                 ports_set.insert(p);
@@ -682,6 +794,7 @@ pub fn discover_local_language_servers() -> Result<Vec<LocalServerInfo>, String>
                 pid,
                 process_name: name,
                 csrf_token,
+                extra_csrf_tokens,
                 ports: ports_set.into_iter().collect(),
                 priority_score: score,
             });
@@ -928,6 +1041,8 @@ fn extract_object_label_tokens(obj: &Value) -> String {
         "group_id",
         "bucketId",
         "bucket_id",
+        "modelId",
+        "model_id",
         "id",
         "window",
         "period",
@@ -963,20 +1078,44 @@ fn extract_object_label_tokens(obj: &Value) -> String {
     parts.join(" ")
 }
 
-fn extract_bucket_pct_and_reset(obj: &Value) -> Option<(f64, Option<String>)> {
+fn extract_bucket_pct_and_reset(
+    obj: &Value,
+    allow_omitted_zero_with_reset: bool,
+) -> Option<(f64, Option<String>)> {
+    if obj.get("disabled").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
     let reset = obj
         .get("resetTime")
         .or_else(|| obj.get("reset_time"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+
+    let oneof_value = if obj
+        .pointer("/remaining/case")
+        .and_then(|v| v.as_str())
+        .is_some_and(|c| c == "remainingFraction" || c == "remaining_fraction")
+    {
+        obj.pointer("/remaining/value").and_then(|v| v.as_f64())
+    } else {
+        None
+    };
+
     let rem = obj
         .get("remainingFraction")
         .or_else(|| obj.get("remaining_fraction"))
         .and_then(|v| v.as_f64())
+        .or_else(|| {
+            obj.pointer("/remaining/remainingFraction")
+                .or_else(|| obj.pointer("/remaining/remaining_fraction"))
+                .and_then(|v| v.as_f64())
+        })
+        .or(oneof_value)
         .map(|f| if f <= 1.0 { f * 100.0 } else { f })
         .or_else(|| {
-            if reset.is_some() {
+            let has_remaining_obj = obj.get("remaining").is_some_and(|r| r.is_object());
+            if (allow_omitted_zero_with_reset || has_remaining_obj) && reset.is_some() {
                 Some(0.0)
             } else {
                 None
@@ -992,6 +1131,8 @@ fn collect_structured_entries(json: &Value) -> Vec<AgyQuotaEntry> {
         .get("groups")
         .or_else(|| json.get("quotaGroups"))
         .or_else(|| json.pointer("/response/groups"))
+        .or_else(|| json.pointer("/summary/groups"))
+        .or_else(|| json.pointer("/quotaSummary/groups"))
         .or_else(|| json.pointer("/userQuotaSummary/groups"))
         .or_else(|| json.pointer("/userQuotaSummary/quotaGroups"))
         .and_then(|v| v.as_array())
@@ -1004,7 +1145,7 @@ fn collect_structured_entries(json: &Value) -> Vec<AgyQuotaEntry> {
                 .and_then(|v| v.as_array());
             if let Some(buckets_arr) = buckets {
                 for b in buckets_arr {
-                    if let Some((pct, reset)) = extract_bucket_pct_and_reset(b) {
+                    if let Some((pct, reset)) = extract_bucket_pct_and_reset(b, false) {
                         let b_label = extract_object_label_tokens(b);
                         let combined = format!("{group_label} {b_label}");
                         let category = classify_agy_category(&combined);
@@ -1018,7 +1159,7 @@ fn collect_structured_entries(json: &Value) -> Vec<AgyQuotaEntry> {
                         });
                     }
                 }
-            } else if let Some((pct, reset)) = extract_bucket_pct_and_reset(grp) {
+            } else if let Some((pct, reset)) = extract_bucket_pct_and_reset(grp, false) {
                 let category = classify_agy_category(&group_label);
                 let window = classify_agy_window(&group_label, reset.as_deref(), &category);
                 entries.push(AgyQuotaEntry {
@@ -1035,12 +1176,14 @@ fn collect_structured_entries(json: &Value) -> Vec<AgyQuotaEntry> {
         .get("buckets")
         .or_else(|| json.get("quotaBuckets"))
         .or_else(|| json.pointer("/response/buckets"))
+        .or_else(|| json.pointer("/summary/buckets"))
+        .or_else(|| json.pointer("/quotaSummary/buckets"))
         .or_else(|| json.pointer("/userQuotaSummary/buckets"))
         .or_else(|| json.pointer("/userQuotaSummary/quotaBuckets"))
         .and_then(|v| v.as_array())
     {
         for b in arr {
-            if let Some((pct, reset)) = extract_bucket_pct_and_reset(b) {
+            if let Some((pct, reset)) = extract_bucket_pct_and_reset(b, true) {
                 let b_label = extract_object_label_tokens(b);
                 let category = classify_agy_category(&b_label);
                 let window = classify_agy_window(&b_label, reset.as_deref(), &category);
@@ -1071,7 +1214,7 @@ fn collect_model_entries(json: &Value) -> Vec<AgyQuotaEntry> {
             let Some(q) = m.get("quotaInfo") else {
                 continue;
             };
-            if let Some((pct, reset)) = extract_bucket_pct_and_reset(q) {
+            if let Some((pct, reset)) = extract_bucket_pct_and_reset(q, true) {
                 let category = classify_agy_category(&label);
                 let window = classify_agy_window(&label, reset.as_deref(), &category);
                 entries.push(AgyQuotaEntry {
@@ -1091,7 +1234,7 @@ fn collect_model_entries(json: &Value) -> Vec<AgyQuotaEntry> {
             let Some(q) = m.get("quotaInfo") else {
                 continue;
             };
-            if let Some((pct, reset)) = extract_bucket_pct_and_reset(q) {
+            if let Some((pct, reset)) = extract_bucket_pct_and_reset(q, true) {
                 let category = classify_agy_category(&combined);
                 let window = classify_agy_window(&combined, reset.as_deref(), &category);
                 entries.push(AgyQuotaEntry {
@@ -1105,6 +1248,11 @@ fn collect_model_entries(json: &Value) -> Vec<AgyQuotaEntry> {
     }
 
     entries
+}
+
+fn all_models_look_full_placeholder(json: &Value) -> bool {
+    let entries = collect_model_entries(json);
+    !entries.is_empty() && entries.iter().all(|e| e.pct >= 99.9)
 }
 
 pub fn has_quota_data(json: &Value) -> bool {
@@ -1609,6 +1757,102 @@ Active Connections
                 ("Gemini 模型池 (周)", 90),
                 ("Argon 模型池 (5h)", 52),
                 ("Claude / GPT 池 (5h)", 100),
+                ("Claude / GPT 池 (周)", 99),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_codexbar_nested_remaining_response_wrapper() {
+        let now = Utc::now();
+        let h4 = (now + chrono::Duration::hours(4)).to_rfc3339();
+        let d6 = (now + chrono::Duration::days(6)).to_rfc3339();
+        let d5 = (now + chrono::Duration::days(5)).to_rfc3339();
+        let payload = serde_json::json!({
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit",
+                                "remaining": { "remainingFraction": 0.90 },
+                                "resetTime": d6
+                            },
+                            {
+                                "bucketId": "gemini-5h",
+                                "displayName": "Five Hour Limit",
+                                "remaining": { "case": "remainingFraction", "value": 0.64 },
+                                "resetTime": h4
+                            },
+                            {
+                                "bucketId": "gemini-disabled",
+                                "displayName": "Five Hour Limit",
+                                "disabled": true,
+                                "remaining": { "remainingFraction": 0.01 }
+                            }
+                        ]
+                    },
+                    {
+                        "displayName": "Claude and GPT models",
+                        "buckets": [
+                            {
+                                "bucketId": "3p-weekly",
+                                "displayName": "Weekly Limit",
+                                "remaining": { "remainingFraction": 0.99 },
+                                "resetTime": d5
+                            },
+                            {
+                                "bucketId": "3p-5h",
+                                "displayName": "Five Hour Limit",
+                                "remaining": { "remainingFraction": 1.0 }
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let quota = parse_antigravity_quota(&sample_record(), &payload).expect("should parse nested remaining");
+        assert_eq!(quota.primary_pct, 64);
+        let names: Vec<(&str, u8)> = quota
+            .sub_pools
+            .iter()
+            .map(|p| (p.name.as_str(), p.pct))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("Gemini 模型池 (5h)", 64),
+                ("Gemini 模型池 (周)", 90),
+                ("Claude / GPT 池 (5h)", 100),
+                ("Claude / GPT 池 (周)", 99),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_retrieve_user_quota_model_id_buckets() {
+        let payload = serde_json::json!({
+            "buckets": [
+                { "modelId": "gemini-4-neon", "remainingFraction": 0.64 },
+                { "modelId": "gemini-4-argon", "remainingFraction": 0.42 },
+                { "modelId": "claude-sonnet-4-6", "remainingFraction": 0.99 }
+            ]
+        });
+        let quota = parse_antigravity_quota(&sample_record(), &payload).expect("should parse modelId buckets");
+        assert_eq!(quota.primary_pct, 64);
+        let names: Vec<(&str, u8)> = quota
+            .sub_pools
+            .iter()
+            .map(|p| (p.name.as_str(), p.pct))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("Gemini 模型池 (5h)", 64),
+                ("Argon 模型池", 42),
                 ("Claude / GPT 池 (周)", 99),
             ]
         );

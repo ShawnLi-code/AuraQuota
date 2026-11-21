@@ -195,12 +195,17 @@ pub fn scraper_script_for(platform: PlatformId, max_wait_ms: u64) -> String {
           }
           if (cRes.ok) {
             const creditsJson = await cRes.json();
+            let subJson = null;
+            try {
+              const bRes = await fetch('https://api.commandcode.ai/internal/billing/subscriptions', { credentials: 'include' });
+              if (bRes.ok) subJson = await bRes.json();
+            } catch (_e1) {}
             let summaryJson = null;
             try {
               const sRes = await fetch('https://api.commandcode.ai/internal/usage/summary', { credentials: 'include' });
               if (sRes.ok) summaryJson = await sRes.json();
             } catch (_e2) {}
-            return send({ ok: true, authRequired: false, url: location.href, creditsJson, summaryJson });
+            return send({ ok: true, authRequired: false, url: location.href, creditsJson, subJson, summaryJson });
           }
         } catch (_e) {}
         const text = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 4500) : '';
